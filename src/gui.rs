@@ -867,6 +867,14 @@ impl App {
                 ))
                 .color(DIM),
             );
+            // e.g. a Live 9 set: show why, and keep Convert disabled.
+            let can_convert = n_conv > 0 && plan.blocked.is_none();
+            if let Some(why) = &plan.blocked {
+                ui.add_space(6.0);
+                egui::Frame::none().fill(Color32::from_rgb(0x3a, 0x22, 0x22)).rounding(4.0).inner_margin(10.0).show(ui, |ui| {
+                    ui.label(RichText::new(why).color(BAD));
+                });
+            }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut c.report_view, false, RichText::new("Plug-ins").strong());
@@ -884,7 +892,7 @@ impl App {
                 });
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(n_conv > 0, accent_button("Convert → save as new version")).clicked() {
+                    if ui.add_enabled(can_convert, accent_button("Convert → save as new version")).clicked() {
                         do_convert = true;
                     }
                     if ui.button("Copy report").clicked() {
@@ -992,7 +1000,7 @@ impl App {
             }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                if ui.add_enabled(n_conv > 0, accent_button("Convert → save as new version")).clicked() {
+                if ui.add_enabled(can_convert, accent_button("Convert → save as new version")).clicked() {
                     do_convert = true;
                 }
                 if ui.button("Learn parameter IDs from a folder…").on_hover_text("Pick a folder with sets that already use the VST3 versions").clicked() {
