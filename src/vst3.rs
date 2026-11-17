@@ -525,28 +525,41 @@ pub struct Plan {
     /// Why this set can't be converted as it is (saved by a Live without VST3).
     pub blocked: Option<String>,
     /// Write VST3 entries the way the set's own Live version does.
-    format: SetFormat,
+    layout: Vst3Layout,
 }
 
-/// Which Live wrote the file, as far as VST3 entries are concerned.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum SetFormat {
-    /// Live 10.0 and older: no VST3 support; Live rejects VST3 entries as "corrupt".
-    NoVst3,
-    /// Live 10.1 and 11: VST3 entries without the bus-count fields.
-    Live10,
-    /// Live 12+: also NumAudioInputs, NumAudioOutputs and IsPlaceholderDevice.
-    Live12,
+/// The optional fields a Live version writes in VST3 entries. Live added them
+/// over time, and Live 12 can crash opening an older-format set that has a
+/// field its version never wrote. Checked against ~700 real sets:
+///
+/// | Live (MinorVersion)           | bus counts | IsPlaceholderDevice | ParameterIdFlankBool |
+/// |-------------------------------|------------|---------------------|----------------------|
+/// | 10.1–11.1 (10.0_376–11.0_436) | no         | no                  | no                   |
+/// | 11.2 (11.0_11202)             | no         | no                  | yes                  |
+/// | 11.3 (11.0_11300)             | yes        | no                  | yes                  |
+/// | 12 (12.0_…)                   | yes        | yes                 | yes                  |
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct Vst3Layout {
+    /// NumAudioInputs / NumAudioOutputs in Vst3PluginInfo
+    pub bus_counts: bool,
+    /// IsPlaceholderDevice in Vst3PluginInfo
+    pub placeholder: bool,
+    /// ParameterIdFlankBool after each ParameterId
+    pub flank: bool,
 }
 
 /// First Live 10 file format that can hold VST3 plug-ins. VST3 arrived in Live 10.1:
 /// all Live 10.0.x sets are "10.0_370"; the 10.1 betas wrote "10.0_376" and
 /// Live 10.1 releases "10.0_377" (checked against real sets).
 const FIRST_VST3_LIVE10_BUILD: u32 = 376;
+/// Live 11.2 and 11.3 file formats ("11.0_11202", "11.0_11300").
+const LIVE_11_2_BUILD: u32 = 11202;
+const LIVE_11_3_BUILD: u32 = 11300;
 
-/// The file format comes from the root element: MajorVersion="4" MinorVersion="9.5_327"
-/// is Live 9, MinorVersion="10.0_370" Live 10.0, "10.0_377" Live 10.1, "11.0_436" Live 11.
-pub fn set_format(major: Option<&str>, minor: Option<&str>) -> SetFormat {
+/// The VST3 layout for a file format, from the root element: MajorVersion="4"
+/// MinorVersion="9.5_327" is Live 9, "10.0_370" Live 10.0, "10.0_377" Live 10.1,
+/// "11.0_436" Live 11.1, "11.0_11202" Live 11.2… None: the format can't hold VST3.
+pub fn vst3_layout(major: Option<&str>, minor: Option<&str>) -> Option<Vst3Layout> {
     let major: u32 = major.and_then(|m| m.trim().parse().ok()).unwrap_or(0);
     let (version, build) = match minor {
         Some(m) => {
@@ -557,12 +570,37 @@ pub fn set_format(major: Option<&str>, minor: Option<&str>) -> SetFormat {
         None => (0, None),
     };
     if major < 5 || version < 10 {
-        return SetFormat::NoVst3;
+        return None;
     }
-    if version == 10 && build.map(|b| b < FIRST_VST3_LIVE10_BUILD).unwrap_or(true) {
-        return SetFormat::NoVst3; // Live 10.0
+    let build = build.unwrap_or(0);
+    Some(match version {
+        10 if build < FIRST_VST3_LIVE10_BUILD => return None, // Live 10.0
+        10 => Vst3Layout::default(),
+        11 if build < LIVE_11_2_BUILD => Vst3Layout::default(),
+        11 if build < LIVE_11_3_BUILD => Vst3Layout { flank: true, ..Default::default() },
+        11 => Vst3Layout { bus_counts: true, flank: true, ..Default::default() },
+        _ => Vst3Layout { bus_counts: true, placeholder: true, flank: true },
+    })
+}
+
+/// Correct the layout from VST3 entries Live itself already wrote in this set,
+/// so the converted ones match them exactly (whatever the Live version).
+fn mirror_layout(doc: &roxmltree::Document, mut layout: Vst3Layout) -> Vst3Layout {
+    if let Some(info) = doc.descendants().find(|n| n.is_element() && tag(*n) == "Vst3PluginInfo") {
+        layout.bus_counts = child(info, "NumAudioInputs").is_some();
+        layout.placeholder = child(info, "IsPlaceholderDevice").is_some();
     }
-    if version < 12 { SetFormat::Live10 } else { SetFormat::Live12 }
+    if doc.descendants().any(|n| n.is_element() && tag(n) == "ParameterIdFlankBool") {
+        layout.flank = true;
+    } else if doc.descendants().any(|pd| {
+        pd.is_element()
+            && tag(pd) == "PluginDevice"
+            && find(pd, "PluginDesc/Vst3PluginInfo").is_some()
+            && child(pd, "ParameterList").map(|l| elements(l).next().is_some()).unwrap_or(false)
+    }) {
+        layout.flank = false; // VST3 parameters written without it
+    }
+    layout
 }
 
 fn ws_start(xml: &str, mut i: usize) -> usize {
@@ -619,7 +657,7 @@ pub fn analyze(path: &Path, catalog: Option<Vec<Plugin>>) -> Result<Plan, String
     }
     let xml = als::read_xml(path).map_err(|e| format!("Can't read the set: {e}"))?;
     let catalog = catalog.unwrap_or_else(load_catalog);
-    let format;
+    let layout;
     let mut blocked = None;
     let (items, envelopes, next_pointee, max_target_id) = {
         let doc = als::parse(&xml)?;
@@ -638,8 +676,9 @@ pub fn analyze(path: &Path, catalog: Option<Vec<Plugin>>) -> Result<Plan, String
             }
         }
         let root = doc.root_element();
-        format = set_format(root.attribute("MajorVersion"), root.attribute("MinorVersion"));
-        if format == SetFormat::NoVst3 {
+        let by_version = vst3_layout(root.attribute("MajorVersion"), root.attribute("MinorVersion"));
+        layout = mirror_layout(&doc, by_version.unwrap_or_default());
+        if by_version.is_none() {
             let creator = root.attribute("Creator").unwrap_or("an old version of Ableton Live");
             blocked = Some(format!(
                 "This set was last saved with {creator}, which had no VST3 support (VST3 arrived in Live 10.1), so its \
@@ -751,7 +790,7 @@ pub fn analyze(path: &Path, catalog: Option<Vec<Plugin>>) -> Result<Plan, String
         }
         (items, envelopes, next_pointee, max_target_id)
     };
-    Ok(Plan { path: path.to_path_buf(), xml, items, catalog_size: catalog.len(), envelopes, next_pointee, max_target_id, blocked, format })
+    Ok(Plan { path: path.to_path_buf(), xml, items, catalog_size: catalog.len(), envelopes, next_pointee, max_target_id, blocked, layout })
 }
 
 // ----------------------------------------------------------------------------- building XML
@@ -794,7 +833,7 @@ fn uid_xml(uid: &[u8; 16], ind: &str, nl: &str) -> String {
     s + &format!("{ind}</Uid>")
 }
 
-fn build_vst3_info(item: &Item, target: &Plugin, state: &[u8], nl: &str, format: SetFormat) -> String {
+fn build_vst3_info(item: &Item, target: &Plugin, state: &[u8], nl: &str, layout: Vst3Layout) -> String {
     let db = learned();
     let lent = db.get(&hex(&target.uid));
     let inst = target.is_instrument();
@@ -806,10 +845,12 @@ fn build_vst3_info(item: &Item, target: &Plugin, state: &[u8], nl: &str, format:
     let mut s = format!("<Vst3PluginInfo Id=\"{}\">{nl}", esc(&item.info_id));
     s += &format!("{i1}<WinPosX Value=\"{}\" />{nl}", esc(&item.win_x));
     s += &format!("{i1}<WinPosY Value=\"{}\" />{nl}", esc(&item.win_y));
-    if format == SetFormat::Live12 {
-        // Live 10/11 files don't have these; adding them there could make Live reject the set.
+    // Only the fields this set's Live version writes (see Vst3Layout).
+    if layout.bus_counts {
         s += &format!("{i1}<NumAudioInputs Value=\"{}\" />{nl}", esc(&inputs));
         s += &format!("{i1}<NumAudioOutputs Value=\"{}\" />{nl}", esc(&outputs));
+    }
+    if layout.placeholder {
         s += &format!("{i1}<IsPlaceholderDevice Value=\"false\" />{nl}");
     }
     s += &format!("{i1}<Preset>{nl}{i2}<Vst3Preset Id=\"{}\">{nl}", esc(&item.preset_id));
@@ -860,6 +901,16 @@ fn apply_edits(text: &str, mut edits: Vec<(Range<usize>, String)>) -> Result<Str
     }
     out.push_str(&text[pos..]);
     Ok(out)
+}
+
+/// The ParameterIdFlankBool value to add after a remapped ParameterId, if any.
+/// Only Live 11.2+ files have this field (the learned value comes from such
+/// sets); Live 12 crashes right after opening an older-format set that has it.
+fn flank_to_add(layout: Vst3Layout, learned: Option<&str>, already_there: bool) -> Option<&str> {
+    match (layout.flank, learned, already_there) {
+        (true, Some(f), false) => Some(f),
+        _ => None,
+    }
 }
 
 /// Automated or mapped parameters whose VST3 ID isn't known: converting drops
@@ -995,7 +1046,7 @@ pub fn convert(plan: &Plan, out_path: Option<PathBuf>) -> Result<(PathBuf, Vec<S
             edits.push((dev.end..dev.end, format!("{nl}{indent}{clone}")));
         }
 
-        edits.push((item.info.clone(), build_vst3_info(item, target, &state_for(item), nl, plan.format)));
+        edits.push((item.info.clone(), build_vst3_info(item, target, &state_for(item), nl, plan.layout)));
         if item.device_tag != "PluginDevice" {
             let t = &item.device_tag;
             edits.push((dev.start + 1..dev.start + 1 + t.len(), "PluginDevice".into()));
@@ -1018,7 +1069,7 @@ pub fn convert(plan: &Plan, out_path: Option<PathBuf>) -> Result<(PathBuf, Vec<S
                     if let Some(r) = &p.id_value {
                         edits.push((r.clone(), esc(pid)));
                     }
-                    if let (Some(f), false) = (flank, p.has_flank) {
+                    if let Some(f) = flank_to_add(plan.layout, flank.as_deref(), p.has_flank) {
                         edits.push((p.id_elem_end..p.id_elem_end, format!("{nl}{}<ParameterIdFlankBool Value=\"{}\" />", p.id_indent, esc(f))));
                     }
                 }
@@ -1081,16 +1132,31 @@ mod tests {
         assert_ne!(normalize("Kick 2 x64"), normalize("Kick 3"));
     }
 
+    /// Live 12 crashed opening converted Live 10/11 sets that had ParameterIdFlankBool.
+    #[test]
+    fn flank_field_only_where_live_writes_it() {
+        let with = Vst3Layout { flank: true, ..Default::default() };
+        assert_eq!(flank_to_add(with, Some("false"), false), Some("false"));
+        assert_eq!(flank_to_add(with, Some("false"), true), None, "already there");
+        assert_eq!(flank_to_add(with, None, false), None);
+        assert_eq!(flank_to_add(Vst3Layout::default(), Some("false"), false), None, "Live 10.1-11.1 never have it");
+    }
+
     #[test]
     fn set_formats() {
-        assert_eq!(set_format(Some("4"), Some("9.5_327")), SetFormat::NoVst3); // Live 9.7
-        assert_eq!(set_format(Some("5"), Some("10.0_370")), SetFormat::NoVst3); // Live 10.0.x: no VST3 yet
-        assert_eq!(set_format(Some("5"), Some("10.0")), SetFormat::NoVst3); // unknown build: be safe
-        assert_eq!(set_format(Some("5"), Some("10.0_376")), SetFormat::Live10); // Live 10.1 beta
-        assert_eq!(set_format(Some("5"), Some("10.0_377")), SetFormat::Live10); // Live 10.1
-        assert_eq!(set_format(Some("5"), Some("11.0_436")), SetFormat::Live10);
-        assert_eq!(set_format(Some("5"), Some("12.0_12402")), SetFormat::Live12);
-        assert_eq!(set_format(None, None), SetFormat::NoVst3);
+        let l = |minor: &str| vst3_layout(Some("5"), Some(minor));
+        let none = Vst3Layout::default();
+        assert_eq!(vst3_layout(Some("4"), Some("9.5_327")), None); // Live 9.7
+        assert_eq!(l("10.0_370"), None); // Live 10.0.x: no VST3 yet
+        assert_eq!(l("10.0"), None); // unknown build: be safe
+        assert_eq!(l("10.0_376"), Some(none)); // Live 10.1 beta
+        assert_eq!(l("10.0_377"), Some(none)); // Live 10.1
+        assert_eq!(l("11.0_433"), Some(none)); // Live 11.0 beta (the crashing set)
+        assert_eq!(l("11.0_436"), Some(none)); // Live 11.1
+        assert_eq!(l("11.0_11202"), Some(Vst3Layout { flank: true, ..none })); // Live 11.2
+        assert_eq!(l("11.0_11300"), Some(Vst3Layout { bus_counts: true, flank: true, ..none })); // Live 11.3
+        assert_eq!(l("12.0_12402"), Some(Vst3Layout { bus_counts: true, placeholder: true, flank: true }));
+        assert_eq!(vst3_layout(None, None), None);
     }
 
     /// A minimal set with one ValhallaRoom VST2, saved as the given Live version.
@@ -1175,15 +1241,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Live 10/11 files write VST3 entries without the Live 12 bus-count fields.
+    /// VST3 entries get exactly the optional fields the set's Live version writes.
     #[test]
     fn vst3_entry_matches_the_sets_live_version() {
         let dir = std::env::temp_dir().join(format!("lv-fmt-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        for (major, minor, creator, live12) in
-            [("5", "11.0_436", "Ableton Live 11.1.6", false), ("5", "12.0_12402", "Ableton Live 12.4.16", true)]
-        {
-            let p = tiny_set(&dir, "Song.als", major, minor, creator);
+        for (minor, creator, bus, placeholder) in [
+            ("11.0_436", "Ableton Live 11.1.6", false, false),
+            ("11.0_11300", "Ableton Live 11.3.13", true, false),
+            ("12.0_12402", "Ableton Live 12.4.16", true, true),
+        ] {
+            let p = tiny_set(&dir, "Song.als", "5", minor, creator);
             let plan = analyze(&p, Some(valhalla())).unwrap();
             assert!(plan.blocked.is_none());
             let out = dir.join("Song v_2.als");
@@ -1191,11 +1259,23 @@ mod tests {
             let xml = als::read_xml(&out).unwrap();
             als::parse(&xml).unwrap();
             assert!(xml.contains("<Vst3PluginInfo"), "{creator}");
-            assert_eq!(xml.contains("<NumAudioInputs"), live12, "{creator}");
-            assert_eq!(xml.contains("<IsPlaceholderDevice"), live12, "{creator}");
+            assert_eq!(xml.contains("<NumAudioInputs"), bus, "{creator}");
+            assert_eq!(xml.contains("<IsPlaceholderDevice"), placeholder, "{creator}");
             std::fs::remove_file(&out).unwrap();
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// VST3 entries Live already wrote in the set win over the version table.
+    #[test]
+    fn layout_mirrors_existing_vst3_entries() {
+        let xml = r#"<Ableton MajorVersion="5" MinorVersion="12.0_12402"><LiveSet><Tracks><AudioTrack Id="1"><DeviceChain><DeviceChain><Devices>
+            <PluginDevice Id="0"><PluginDesc><Vst3PluginInfo Id="0"><WinPosX Value="0" /><NumAudioInputs Value="1" /><Name Value="X" /></Vst3PluginInfo></PluginDesc>
+            <ParameterList><PluginFloatParameter Id="0"><ParameterName Value="a" /><ParameterId Value="1" /></PluginFloatParameter></ParameterList></PluginDevice>
+            </Devices></DeviceChain></DeviceChain></AudioTrack></Tracks></LiveSet></Ableton>"#;
+        let doc = als::parse(xml).unwrap();
+        let start = Vst3Layout { bus_counts: true, placeholder: true, flank: true };
+        assert_eq!(mirror_layout(&doc, start), Vst3Layout { bus_counts: true, placeholder: false, flank: false });
     }
 
     /// Reads this machine's Live plug-in database if there is one (read-only).
