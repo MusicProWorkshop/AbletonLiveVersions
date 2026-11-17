@@ -531,26 +531,38 @@ pub struct Plan {
 /// Which Live wrote the file, as far as VST3 entries are concerned.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SetFormat {
-    /// Live 9 and older: no VST3 support; Live rejects VST3 entries as "corrupt".
+    /// Live 10.0 and older: no VST3 support; Live rejects VST3 entries as "corrupt".
     NoVst3,
-    /// Live 10 and 11: VST3 entries without the bus-count fields.
+    /// Live 10.1 and 11: VST3 entries without the bus-count fields.
     Live10,
     /// Live 12+: also NumAudioInputs, NumAudioOutputs and IsPlaceholderDevice.
     Live12,
 }
 
+/// First Live 10 file format that can hold VST3 plug-ins. VST3 arrived in Live 10.1:
+/// all Live 10.0.x sets are "10.0_370"; the 10.1 betas wrote "10.0_376" and
+/// Live 10.1 releases "10.0_377" (checked against real sets).
+const FIRST_VST3_LIVE10_BUILD: u32 = 376;
+
 /// The file format comes from the root element: MajorVersion="4" MinorVersion="9.5_327"
-/// is Live 9, MajorVersion="5" MinorVersion="11.0_436" is Live 11, and so on.
+/// is Live 9, MinorVersion="10.0_370" Live 10.0, "10.0_377" Live 10.1, "11.0_436" Live 11.
 pub fn set_format(major: Option<&str>, minor: Option<&str>) -> SetFormat {
     let major: u32 = major.and_then(|m| m.trim().parse().ok()).unwrap_or(0);
-    let minor: u32 = minor.and_then(|m| m.split(['.', '_']).next()?.trim().parse().ok()).unwrap_or(0);
-    if major < 5 || minor < 10 {
-        SetFormat::NoVst3
-    } else if minor < 12 {
-        SetFormat::Live10
-    } else {
-        SetFormat::Live12
+    let (version, build) = match minor {
+        Some(m) => {
+            let version: u32 = m.split(['.', '_']).next().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+            let build: Option<u32> = m.split('_').nth(1).and_then(|b| b.trim().parse().ok());
+            (version, build)
+        }
+        None => (0, None),
+    };
+    if major < 5 || version < 10 {
+        return SetFormat::NoVst3;
     }
+    if version == 10 && build.map(|b| b < FIRST_VST3_LIVE10_BUILD).unwrap_or(true) {
+        return SetFormat::NoVst3; // Live 10.0
+    }
+    if version < 12 { SetFormat::Live10 } else { SetFormat::Live12 }
 }
 
 fn ws_start(xml: &str, mut i: usize) -> usize {
@@ -630,9 +642,9 @@ pub fn analyze(path: &Path, catalog: Option<Vec<Plugin>>) -> Result<Plan, String
         if format == SetFormat::NoVst3 {
             let creator = root.attribute("Creator").unwrap_or("an old version of Ableton Live");
             blocked = Some(format!(
-                "This set was last saved with {creator}, which had no VST3 support, so its file can't hold VST3 plug-ins \
-                 (Live would report the converted set as corrupt). Open it in your current Live and save it \
-                 (the version shortcut saves it as the next version), then convert that new version."
+                "This set was last saved with {creator}, which had no VST3 support (VST3 arrived in Live 10.1), so its \
+                 file can't hold VST3 plug-ins (Live would report the converted set as corrupt). Open it in your current \
+                 Live and save it (the version shortcut saves it as the next version), then convert that new version."
             ));
         }
         let ls = child(root, "LiveSet").ok_or("Not a Live set (no LiveSet element)")?;
@@ -1072,7 +1084,10 @@ mod tests {
     #[test]
     fn set_formats() {
         assert_eq!(set_format(Some("4"), Some("9.5_327")), SetFormat::NoVst3); // Live 9.7
-        assert_eq!(set_format(Some("5"), Some("10.0_377")), SetFormat::Live10);
+        assert_eq!(set_format(Some("5"), Some("10.0_370")), SetFormat::NoVst3); // Live 10.0.x: no VST3 yet
+        assert_eq!(set_format(Some("5"), Some("10.0")), SetFormat::NoVst3); // unknown build: be safe
+        assert_eq!(set_format(Some("5"), Some("10.0_376")), SetFormat::Live10); // Live 10.1 beta
+        assert_eq!(set_format(Some("5"), Some("10.0_377")), SetFormat::Live10); // Live 10.1
         assert_eq!(set_format(Some("5"), Some("11.0_436")), SetFormat::Live10);
         assert_eq!(set_format(Some("5"), Some("12.0_12402")), SetFormat::Live12);
         assert_eq!(set_format(None, None), SetFormat::NoVst3);
@@ -1141,19 +1156,22 @@ mod tests {
         vec![Plugin { uid, name: "ValhallaRoom".into(), vendor: "Valhalla DSP, LLC".into(), kind: "audiofx".into(), dev_id: "device:vst3:audiofx:x".into() }]
     }
 
-    /// Live 9 had no VST3: converting must refuse instead of writing a set Live calls corrupt.
+    /// Live 9 and Live 10.0 had no VST3: converting must refuse instead of
+    /// writing a set Live calls corrupt.
     #[test]
-    fn live9_sets_are_not_converted() {
+    fn sets_from_before_live_10_1_are_not_converted() {
         let dir = std::env::temp_dir().join(format!("lv-fmt9-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let p = tiny_set(&dir, "Old Song v_12.als", "4", "9.5_327", "Ableton Live 9.7.4");
-        let plan = analyze(&p, Some(valhalla())).unwrap();
-        assert_eq!(plan.items.len(), 1);
-        assert_eq!(plan.items[0].mode, Mode::Vst2State, "the plug-in itself is convertible");
-        assert!(plan.blocked.as_deref().unwrap_or("").contains("Ableton Live 9.7.4"));
-        assert!(convert(&plan, Some(dir.join("out.als"))).is_err());
-        assert!(!dir.join("out.als").exists(), "nothing may be written");
-        assert!(preview_report(&plan)[0].starts_with("Can't convert"));
+        for (major, minor, creator) in [("4", "9.5_327", "Ableton Live 9.7.4"), ("5", "10.0_370", "Ableton Live 10.0.5b1")] {
+            let p = tiny_set(&dir, "Old Song v_12.als", major, minor, creator);
+            let plan = analyze(&p, Some(valhalla())).unwrap();
+            assert_eq!(plan.items.len(), 1);
+            assert_eq!(plan.items[0].mode, Mode::Vst2State, "the plug-in itself is convertible");
+            assert!(plan.blocked.as_deref().unwrap_or("").contains(creator), "{creator}");
+            assert!(convert(&plan, Some(dir.join("out.als"))).is_err(), "{creator}");
+            assert!(!dir.join("out.als").exists(), "nothing may be written");
+            assert!(preview_report(&plan)[0].starts_with("Can't convert"));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

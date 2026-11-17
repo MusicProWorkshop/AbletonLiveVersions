@@ -104,6 +104,10 @@ automation is removed rather than left driving the wrong control, and the report
 Installed VST3s are read from Live's own plug-in database, so rescan plug-ins in Live first if you
 just installed one. Audio Unit conversion (sets made on a Mac) is supported but untested.
 
+**Older sets:** VST3 support arrived in **Live 10.1**. A set last saved with Live 9 or Live 10.0
+can't hold VST3 plug-ins, so it isn't converted (the report still shows what would happen). Open it
+in your current Live, save it (Ctrl+Alt+S saves it as the next version), then convert that version.
+
 ## Command line
 
 The same exe has a command line (run it from a terminal):
