@@ -630,7 +630,7 @@ impl App {
                     .striped(true)
                     .sense(egui::Sense::click())
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                    .column(Column::exact(96.0))
+                    .column(Column::exact(160.0).clip(true))
                     .column(Column::exact(140.0))
                     .column(Column::exact(56.0))
                     .column(Column::remainder().clip(true))

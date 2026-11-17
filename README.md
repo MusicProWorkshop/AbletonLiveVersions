@@ -22,7 +22,14 @@ ever overwritten. Running the exe a second time just opens the browser.
 
 Recognised: `Song v_3`, `Song_3` (Live Enhancement Suite), `Song v3`, `Song v003`, `Song T03`,
 `Song Take 3`, and the words `ver`, `version`, `rev`, `r`. Dates (`2026-11-13`) and names like
-`Kick 2` aren't versions. The format of each new version is chosen in this order:
+`Kick 2` aren't versions.
+
+Text after the number belongs to that version: `Song v054 MASTER`, `Song T58 HD`, `Song T50b`
+and `Song v051 Bass Update_3` are v054, T58, T50 and v051 of `Song`. They're listed with the
+other versions, saving from one continues the main numbering (`Song v055`), and its change notes
+compare it with the plain version of the same number (`v054`) when there is one.
+
+The format of each new version is chosen in this order:
 
 1. the format of the set you're in (`Song T02` → `Song T03`, `Song v009` → `Song v010`);
 2. for a set without a number: the format of its other versions;

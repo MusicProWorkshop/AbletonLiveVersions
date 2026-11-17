@@ -63,15 +63,56 @@ pub struct Version {
     pub format: Option<VersionFormat>,
     /// The version part as written, e.g. "v_3", "_8", "T01".
     token: String,
+    /// Text after the number, e.g. "MASTER" in "Song v054 MASTER".
+    pub description: String,
 }
 
 impl Version {
     pub fn numbered(&self) -> bool {
         self.format.is_some()
     }
+    /// The version part as written: "v_3", "T50b", "v054 MASTER", or "original".
     pub fn label(&self) -> String {
         if self.numbered() { self.token.clone() } else { "original".into() }
     }
+}
+
+/// Like `split_version`, but also accepts a description after the number:
+/// "Song v054 MASTER" is v054 of "Song" with description "MASTER". The
+/// rightmost version marker that is followed by a separator wins.
+pub fn split_with_description(stem: &str, words: &[String]) -> Option<(String, VersionFormat, u32, String, String)> {
+    let whole = split_version(stem, words);
+    // A version word ("v054", "T58") followed by text wins over a trailing
+    // Live Enhancement Suite "_3": "Song v051 Bass Update_3" is v051.
+    if let Some((b, f, n, t)) = whole.clone().filter(|(_, f, _, _)| f.marker != "_") {
+        return Some((b, f, n, t, String::new()));
+    }
+    let bytes = stem.as_bytes();
+    for j in (1..stem.len()).rev() {
+        // j = end of a run of digits, followed by either a separator ("v054 MASTER")
+        // or one or two letters ending the name or a word ("T50b", "T50b HD").
+        if !bytes[j - 1].is_ascii_digit() {
+            continue;
+        }
+        let after = bytes[j] as char;
+        let ok = if SEPARATORS.contains(&after) {
+            true
+        } else if after.is_ascii_alphabetic() {
+            let letters = stem[j..].chars().take_while(|c| c.is_ascii_alphabetic()).count();
+            let next = stem[j + letters..].chars().next();
+            letters <= 2 && next.map(|c| SEPARATORS.contains(&c)).unwrap_or(true)
+        } else {
+            false
+        };
+        let description = stem[j..].trim_matches(SEPARATORS).trim();
+        if !ok || description.is_empty() {
+            continue;
+        }
+        if let Some((b, f, n, t)) = split_version(&stem[..j], words).filter(|(_, f, _, _)| f.marker != "_") {
+            return Some((b, f, n, t, description.to_string()));
+        }
+    }
+    whole.map(|(b, f, n, t)| (b, f, n, t, String::new()))
 }
 
 /// Recognised version words: the built-in ones plus the word of the user's default format.
@@ -126,9 +167,12 @@ pub fn split_version(stem: &str, words: &[String]) -> Option<(String, VersionFor
 
 pub fn parse_with(path: &Path, words: &[String]) -> Version {
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    match split_version(&stem, words) {
-        Some((base, format, num, token)) => Version { path: path.to_path_buf(), base, num, format: Some(format), token },
-        None => Version { path: path.to_path_buf(), base: stem, num: 1, format: None, token: String::new() },
+    match split_with_description(&stem, words) {
+        Some((base, format, num, _, description)) => {
+            let token = stem[base.len()..].trim_start_matches(SEPARATORS).to_string();
+            Version { path: path.to_path_buf(), base, num, format: Some(format), token, description }
+        }
+        None => Version { path: path.to_path_buf(), base: stem, num: 1, format: None, token: String::new(), description: String::new() },
     }
 }
 
@@ -247,7 +291,12 @@ pub fn previous_version(path: &Path) -> Option<PathBuf> {
         }
     }
     let me = parse(path);
-    family(path).into_iter().filter(|v| v.num < me.num).last().map(|v| v.path)
+    // "Song v054 MASTER" is compared with plain "Song v054" when there is one.
+    family(path)
+        .into_iter()
+        .filter(|v| v.num < me.num || (v.num == me.num && v.description.is_empty() && !me.description.is_empty() && v.path != me.path))
+        .last()
+        .map(|v| v.path)
 }
 
 // ----------------------------------------------------------------------------- notes files
@@ -400,6 +449,43 @@ mod tests {
         for stem in ["Song", "2026-11-13", "Kick 2", "SongT01", "2022_03_19", "Eighties & Teens v_7 Serum Brass", "v2", "_3"] {
             assert_eq!(split(stem), None, "{stem}");
         }
+    }
+
+    #[test]
+    fn versions_with_a_description() {
+        let w = words(&config::Config::default());
+        let s = |stem: &str| split_with_description(stem, &w).map(|(b, f, n, _, d)| (b, f.marker, f.width, n, d));
+        let some = |b: &str, m: &str, wd: usize, n: u32, d: &str| Some((b.to_string(), m.to_string(), wd, n, d.to_string()));
+        assert_eq!(s("Feels So Good v054 MASTER"), some("Feels So Good", " v", 3, 54, "MASTER"));
+        assert_eq!(s("2018 Week Two - Insomnia T58 HD"), some("2018 Week Two - Insomnia", " T", 1, 58, "HD"));
+        assert_eq!(s("Eighties & Teens v_7 Serum Brass"), some("Eighties & Teens", " v_", 1, 7, "Serum Brass"));
+        assert_eq!(s("Song v_3"), some("Song", " v_", 1, 3, ""));
+        assert_eq!(s("Crazy Remix 2 (128 7A Dm 2018-08-17) v002"), some("Crazy Remix 2 (128 7A Dm 2018-08-17)", " v", 3, 2, ""));
+        assert_eq!(s("2018 Week Two - Insomnia T50b"), some("2018 Week Two - Insomnia", " T", 1, 50, "b"));
+        assert_eq!(s("Feels So Good v051 Bass Update_3"), some("Feels So Good", " v", 3, 51, "Bass Update_3"));
+        assert_eq!(s("2022-03-19 Midi Melodies_8"), some("2022-03-19 Midi Melodies", "_", 1, 8, "")); // plain LES still works
+        assert_eq!(s("Song v2mix"), None, "three glued letters are not a variant");
+        // a number followed by text is not enough without a version marker
+        for stem in ["Kick 2 MASTER", "Song (128 7A Dm)", "2026-11-13 Final", "Remix 2 Bootleg"] {
+            assert_eq!(s(stem), None, "{stem}");
+        }
+    }
+
+    #[test]
+    fn described_versions_join_their_set() {
+        let cfg = config::Config::default();
+        let d = folder("described", &["Song v053.als", "Song v054.als", "Song v054 MASTER.als", "Song T07 HD.als"]);
+        let words = words(&cfg);
+        let fam = family_with(&d.join("Song v054 MASTER.als"), &words);
+        assert_eq!(fam.len(), 4, "all four belong to Song");
+        let master = parse_with(&d.join("Song v054 MASTER.als"), &words);
+        assert_eq!(master.label(), "v054 MASTER");
+        assert_eq!(parse_with(&d.join("Song T07 HD.als"), &words).label(), "T07 HD");
+        assert_eq!(next(&d, "Song v054 MASTER.als", &cfg), "Song v055.als");
+        // compared with plain v054, not v053
+        assert_eq!(previous_version(&d.join("Song v054 MASTER.als")).unwrap().file_name().unwrap(), "Song v054.als");
+        assert_eq!(previous_version(&d.join("Song v054.als")).unwrap().file_name().unwrap(), "Song v053.als");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
