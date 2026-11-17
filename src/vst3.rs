@@ -426,7 +426,7 @@ fn find_target(src: &Source, catalog: &[Plugin]) -> (Option<Plugin>, Option<&'st
     (None, None)
 }
 
-fn default_mode(src: &Source, m: Option<&str>) -> (Mode, &'static str) {
+fn default_mode(src: &Source, m: Option<&str>, instrument: bool) -> (Mode, &'static str) {
     match m {
         None => (Mode::Skip, "No VST3 with this ID or name is installed."),
         Some(_) if src.shell => (Mode::Skip, "Shell plug-in (e.g. Waves): not supported."),
@@ -440,6 +440,13 @@ fn default_mode(src: &Source, m: Option<&str>) -> (Mode, &'static str) {
             }
         }
         _ if src.chunk_kind == "juce" => (Mode::Raw, "JUCE plug-in: its saved state is usually the same in every format."),
+        // An instrument can't get a side-by-side copy: a chain holds only one instrument
+        // (Live crashes opening a set with two in a chain). Keep its sound instead.
+        _ if instrument => (
+            Mode::Skip,
+            "Instrument with different plug-in IDs: its sound can't be converted, so it stays VST2. \
+             Pick \"VST3 with default settings\" to replace it anyway.",
+        ),
         _ => (Mode::SideBySide, "Different plug-in IDs: settings can't be converted automatically."),
     }
 }
@@ -498,6 +505,11 @@ impl Item {
     pub fn new_label(&self) -> String {
         self.target.as_ref().map(|t| format!("{} [VST3]", t.name)).unwrap_or_else(|| "— no VST3 found —".into())
     }
+    /// An instrument (on either side): it can't share a chain with another instrument.
+    pub fn is_instrument(&self) -> bool {
+        self.src.is_instrument || self.target.as_ref().map(|t| t.is_instrument()).unwrap_or(false)
+    }
+
     pub fn modes(&self) -> Vec<Mode> {
         if self.target.is_none() {
             return vec![Mode::Skip];
@@ -509,7 +521,10 @@ impl Item {
         if self.src.chunk.is_some() {
             m.push(Mode::Raw);
         }
-        m.extend([Mode::SideBySide, Mode::Default, Mode::Skip]);
+        if !self.is_instrument() {
+            m.push(Mode::SideBySide);
+        }
+        m.extend([Mode::Default, Mode::Skip]);
         m
     }
 }
@@ -713,7 +728,8 @@ pub fn analyze(path: &Path, catalog: Option<Vec<Plugin>>) -> Result<Plan, String
                 .map(|t| val(t, "Name/EffectiveName").map(String::from).unwrap_or_else(|| tag(t).replace("Track", "")))
                 .unwrap_or_default();
             let (target, match_kind) = find_target(&src, &catalog);
-            let (mode, note) = default_mode(&src, match_kind);
+            let instrument = src.is_instrument || target.as_ref().map(|t| t.is_instrument()).unwrap_or(false);
+            let (mode, note) = default_mode(&src, match_kind, instrument);
             let lmap = target.as_ref().and_then(|t| db.get(&hex(&t.uid)));
             let params: Vec<Node> = child(dev, "ParameterList").map(|l| elements(l).collect()).unwrap_or_default();
             let mut recs = Vec::new();
@@ -1025,6 +1041,10 @@ pub fn convert(plan: &Plan, out_path: Option<PathBuf>) -> Result<(PathBuf, Vec<S
         };
         let dev = item.device.clone();
 
+        if item.mode == Mode::SideBySide && item.is_instrument() {
+            // Never write two instruments into one chain: Live crashes opening such a set.
+            return Err(format!("{}: an instrument can't be kept side by side with its VST3 (one instrument per chain).", item.old_label()));
+        }
         if item.mode == Mode::SideBySide {
             // Copy of the untouched old device, switched off, with fresh automation IDs.
             let mut sub = Vec::new();
@@ -1213,6 +1233,43 @@ mod tests {
         let p = dir.join(name);
         als::write_als(&p, &xml).unwrap();
         p
+    }
+
+    /// Live crashed opening sets where Spire (an instrument) had been kept side by
+    /// side with its VST3: two instruments in one chain.
+    #[test]
+    fn instruments_are_never_copied_side_by_side() {
+        let dir = std::env::temp_dir().join(format!("lv-inst-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = tiny_set(&dir, "Synth.als", "5", "12.0_12402", "Ableton Live 12.4.16");
+        // Turn the effect into a Spire-like instrument: VST2 category 2, non-JUCE state.
+        let xml = als::read_xml(&p)
+            .unwrap()
+            .replace("ValhallaRoom_x64", "Spire-1.5")
+            .replace("1383429485", "1399878194")
+            .replace("<Category Value=\"1\" />", "<Category Value=\"2\" />")
+            .replace("<Buffer>56433221</Buffer>", "<Buffer>00112233</Buffer>");
+        als::write_als(&p, &xml).unwrap();
+        let spire = vec![Plugin { uid: [0x2d; 16], name: "Spire".into(), vendor: "Reveal Sound".into(), kind: "instr".into(), dev_id: "device:vst3:instr:x".into() }];
+        let mut plan = analyze(&p, Some(spire)).unwrap();
+        let it = &plan.items[0];
+        assert_eq!(it.match_kind, Some("name"));
+        assert!(it.is_instrument());
+        assert_eq!(it.mode, Mode::Skip, "keeps its sound as VST2 by default");
+        assert!(!it.modes().contains(&Mode::SideBySide));
+        assert!(it.modes().contains(&Mode::Default));
+        // Forcing a side-by-side copy anyway is refused, nothing written.
+        let out = dir.join("Synth v_2.als");
+        plan.items[0].mode = Mode::SideBySide;
+        assert!(convert(&plan, Some(out.clone())).is_err());
+        assert!(!out.exists());
+        // Default settings: replaced, one instrument in the chain.
+        plan.items[0].mode = Mode::Default;
+        convert(&plan, Some(out.clone())).unwrap();
+        let xml = als::read_xml(&out).unwrap();
+        assert_eq!(xml.matches("<PluginDevice ").count(), 1);
+        assert!(xml.contains("<Vst3PluginInfo"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn valhalla() -> Vec<Plugin> {
