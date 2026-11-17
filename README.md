@@ -104,7 +104,7 @@ No C compiler is needed.
 .\build.ps1 test-all         # also drives a real Save dialog (takes focus for a few seconds)
 ```
 
-`assets/make_icon.py` regenerates the icon. `prototype/` holds the first Python version.
+`assets/make_icon.py` regenerates the icon.
 
 Source: `src/als.rs` (read sets, snapshot), `changes.rs` (diff), `versions.rs` (v_N naming,
 notes), `vst3.rs` (converter), `sqlite.rs` (reads Live's plug-in database), `gui.rs` (windows),
