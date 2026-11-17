@@ -173,7 +173,7 @@ notes), `vst3.rs` (converter), `sqlite.rs` (reads Live's plug-in database), `gui
 
 ## License
 
-Copyright (C) 2026 MusicProWorkshop
+Copyright (C) 2026 Ishai Hachlili
 
 Live Versions is free software: you can redistribute it and/or modify it under the terms of the
 [GNU General Public License](LICENSE) as published by the Free Software Foundation, either version 3
