@@ -1,6 +1,9 @@
 # Live Versions
 
+[![CI](https://github.com/MusicProWorkshop/AbletonLiveVersions/actions/workflows/ci.yml/badge.svg)](https://github.com/MusicProWorkshop/AbletonLiveVersions/actions/workflows/ci.yml)
+
 Version management for Ableton Live sets, plus a VST2/AU → VST3 converter.
+Download the latest **LiveVersions.exe** from [Releases](https://github.com/MusicProWorkshop/AbletonLiveVersions/releases/latest).
 One file, `LiveVersions.exe` (about 6 MB). No installer, nothing else to install.
 
 ## Using it
@@ -139,6 +142,24 @@ No C compiler is needed.
 ```
 
 `assets/make_icon.py` regenerates the icon.
+
+On GitHub, the **CI** workflow runs the tests on every pull request and push to `main`
+(a plain `cargo test` works there; the runners have the Visual Studio tools).
+
+### Releasing
+
+Releases are built and published by the **Release** workflow (`.github/workflows/release.yml`):
+
+1. In a pull request, bump `version` in `Cargo.toml` and `assets/app.manifest`, and add
+   `.github/release-notes/v<version>.md` with what's new. Merge it.
+2. Push the tag: `git tag v0.3.2 && git push origin v0.3.2` (or create the release on GitHub's
+   *Draft a new release* page with a new tag).
+
+The workflow checks that the tag matches `Cargo.toml` and that the notes file exists, runs the
+tests, builds the exe, checks the exe's own version, and publishes `LiveVersions.exe` and its
+SHA-256. The install/update section of the notes comes from `.github/release-notes/_install.md`.
+*Run workflow* on the Actions page does a dry run: same build, nothing published, the exe is
+attached to the run.
 
 Source: `src/als.rs` (read sets, snapshot), `changes.rs` (diff), `versions.rs` (v_N naming,
 notes), `vst3.rs` (converter), `sqlite.rs` (reads Live's plug-in database), `gui.rs` (windows),
