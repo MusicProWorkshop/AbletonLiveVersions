@@ -1,0 +1,122 @@
+# Builds and publishes a release when a version tag is pushed (e.g. v0.3.2).
+#
+#   1. Bump the version in Cargo.toml and add .github/release-notes/v<version>.md
+#      (what's new) in a pull request; merge it.
+#   2. Push the tag:  git tag v0.3.2 && git push origin v0.3.2
+#      (or create the release from GitHub's "Draft a new release" page with a new tag).
+#
+# The workflow checks that the tag matches Cargo.toml, runs the tests, builds the
+# exe, checks the exe's own version, and publishes LiveVersions.exe plus its
+# SHA-256 with the release notes and the standard install/update section.
+#
+# "Run workflow" (manual) does a dry run: same checks and build, the exe is
+# attached to the run as an artifact, nothing is published.
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-
+
+      - name: Check version and release notes
+        id: version
+        run: |
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          "Cargo.toml version: $ver"
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            if ("v$ver" -ne $env:GITHUB_REF_NAME) {
+              Write-Error "Tag $env:GITHUB_REF_NAME doesn't match the version in Cargo.toml ($ver). Bump Cargo.toml first."
+              exit 1
+            }
+            if (-not (Test-Path ".github/release-notes/v$ver.md")) {
+              Write-Error "Missing .github/release-notes/v$ver.md (what's new in this release)."
+              exit 1
+            }
+          }
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Check the exe and compute its SHA-256
+        id: exe
+        run: |
+          $exe = Get-Item target/release/LiveVersions.exe
+          $want = "${{ steps.version.outputs.version }}"
+          if ($exe.VersionInfo.FileVersion -ne $want) {
+            Write-Error "LiveVersions.exe reports version $($exe.VersionInfo.FileVersion), expected $want"
+            exit 1
+          }
+          $hash = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item $exe.FullName out/LiveVersions.exe
+          Set-Content out/LiveVersions.exe.sha256 "$hash *LiveVersions.exe" -Encoding ascii -NoNewline
+          "LiveVersions.exe $want  ($([math]::Round($exe.Length / 1MB, 2)) MB)  SHA-256 $hash"
+
+      - name: Release notes
+        run: |
+          $ver = "${{ steps.version.outputs.version }}"
+          $notes = ".github/release-notes/v$ver.md"
+          $body = if (Test-Path $notes) { Get-Content $notes -Raw } else { "_No release notes file for v$ver (dry run)._`n" }
+          $install = (Get-Content .github/release-notes/_install.md -Raw).Replace("{SHA256}", "${{ steps.exe.outputs.sha256 }}")
+          Set-Content out/release-notes.md ($body.TrimEnd() + "`n`n" + $install) -Encoding utf8
+
+      - name: Attach to this run
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveVersions-${{ steps.version.outputs.version }}
+          path: out/
+          if-no-files-found: error
+
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $ver = "${{ steps.version.outputs.version }}"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            # A release was already created for this tag (e.g. from the GitHub page): fill it in.
+            gh release edit $tag --notes-file out/release-notes.md
+            gh release upload $tag "out/LiveVersions.exe#LiveVersions.exe (Windows, 64-bit)" out/LiveVersions.exe.sha256 --clobber
+          } else {
+            gh release create $tag "out/LiveVersions.exe#LiveVersions.exe (Windows, 64-bit)" out/LiveVersions.exe.sha256 `
+              --title "Live Versions $ver" --notes-file out/release-notes.md --verify-tag
+          }
+          gh release view $tag --json url --jq .url
