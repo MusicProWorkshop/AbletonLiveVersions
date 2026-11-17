@@ -1,6 +1,6 @@
 [package]
 name = "live-versions"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Version manager for Ableton Live sets, with a VST2/AU to VST3 converter"
 build = "build.rs"
