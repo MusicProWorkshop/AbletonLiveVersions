@@ -13,7 +13,7 @@ One file, `LiveVersions.exe` (about 6 MB). No installer, nothing else to install
 3. Press **Ctrl+Alt+V** (or click the tray icon) to open the **version browser**.
 
 Right-click the tray icon for: version browser, Plug-in report, Convert a set to VST3, Settings,
-**Start with Windows**, and **Quit**.
+**Start with Windows**, and **Quit** (which also closes any open browser, converter or settings window).
 
 If you're in an older version (v_3 while v_6 exists), the shortcut saves **v_7**, so nothing is
 ever overwritten. Running the exe a second time just opens the browser.

@@ -265,6 +265,9 @@ fn handle_command(st: &mut State, id: usize) {
             }
         }
         ID_QUIT => unsafe {
+            // Quit means all of Live Versions: also the browser, converter and
+            // settings windows, which run as their own processes.
+            super::close_app_windows();
             // Posted, not called: WM_DESTROY needs STATE, which we're holding here.
             let _ = PostMessageW(st.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
         },
@@ -327,6 +330,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     }
                 }
             }
+            LRESULT(0)
+        }
+        // Menu commands can also arrive as WM_COMMAND (e.g. from another process).
+        WM_COMMAND => {
+            let id = wp.0 & 0xFFFF;
+            with_state(|s| handle_command(s, id));
             LRESULT(0)
         }
         WM_HOTKEY => {

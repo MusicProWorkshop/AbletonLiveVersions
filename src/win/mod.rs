@@ -59,6 +59,39 @@ pub fn process_running(exe_prefix: &str) -> bool {
     }
 }
 
+/// Ask every window of the app (browser, converter, settings) to close: those of
+/// other processes running this same exe. Command-line runs have no windows and
+/// are left alone. Returns how many windows were asked to close.
+pub fn close_app_windows() -> usize {
+    let me = std::process::id();
+    let my_exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .map(|p| p.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let same_exe = |pid: u32| {
+        let e = live::exe_of(pid);
+        !e.is_empty()
+            && std::fs::canonicalize(&e).map(|p| p.to_string_lossy().to_lowercase()).unwrap_or_else(|_| e.to_lowercase()) == my_exe
+    };
+    let mut n = 0;
+    for (h, _) in live::top_windows() {
+        let pid = live::window_pid(h);
+        if pid != me && same_exe(pid) {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    h,
+                    windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+                    windows::Win32::Foundation::WPARAM(0),
+                    windows::Win32::Foundation::LPARAM(0),
+                );
+            }
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Bring a process's main window to the front. False if it has no visible window.
 pub fn focus_process(pid: u32) -> bool {
     let Some((h, _)) = live::top_windows().into_iter().find(|(h, t)| live::window_pid(*h) == pid && !t.is_empty()) else {
