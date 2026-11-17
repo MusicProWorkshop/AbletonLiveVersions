@@ -522,6 +522,35 @@ pub struct Plan {
     envelopes: Vec<(String, Range<usize>)>,
     next_pointee: Option<(Range<usize>, i64)>,
     max_target_id: i64,
+    /// Why this set can't be converted as it is (saved by a Live without VST3).
+    pub blocked: Option<String>,
+    /// Write VST3 entries the way the set's own Live version does.
+    format: SetFormat,
+}
+
+/// Which Live wrote the file, as far as VST3 entries are concerned.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SetFormat {
+    /// Live 9 and older: no VST3 support; Live rejects VST3 entries as "corrupt".
+    NoVst3,
+    /// Live 10 and 11: VST3 entries without the bus-count fields.
+    Live10,
+    /// Live 12+: also NumAudioInputs, NumAudioOutputs and IsPlaceholderDevice.
+    Live12,
+}
+
+/// The file format comes from the root element: MajorVersion="4" MinorVersion="9.5_327"
+/// is Live 9, MajorVersion="5" MinorVersion="11.0_436" is Live 11, and so on.
+pub fn set_format(major: Option<&str>, minor: Option<&str>) -> SetFormat {
+    let major: u32 = major.and_then(|m| m.trim().parse().ok()).unwrap_or(0);
+    let minor: u32 = minor.and_then(|m| m.split(['.', '_']).next()?.trim().parse().ok()).unwrap_or(0);
+    if major < 5 || minor < 10 {
+        SetFormat::NoVst3
+    } else if minor < 12 {
+        SetFormat::Live10
+    } else {
+        SetFormat::Live12
+    }
 }
 
 fn ws_start(xml: &str, mut i: usize) -> usize {
@@ -578,6 +607,8 @@ pub fn analyze(path: &Path, catalog: Option<Vec<Plugin>>) -> Result<Plan, String
     }
     let xml = als::read_xml(path).map_err(|e| format!("Can't read the set: {e}"))?;
     let catalog = catalog.unwrap_or_else(load_catalog);
+    let format;
+    let mut blocked = None;
     let (items, envelopes, next_pointee, max_target_id) = {
         let doc = als::parse(&xml)?;
         learn_from_doc(&doc);
@@ -595,6 +626,15 @@ pub fn analyze(path: &Path, catalog: Option<Vec<Plugin>>) -> Result<Plan, String
             }
         }
         let root = doc.root_element();
+        format = set_format(root.attribute("MajorVersion"), root.attribute("MinorVersion"));
+        if format == SetFormat::NoVst3 {
+            let creator = root.attribute("Creator").unwrap_or("an old version of Ableton Live");
+            blocked = Some(format!(
+                "This set was last saved with {creator}, which had no VST3 support, so its file can't hold VST3 plug-ins \
+                 (Live would report the converted set as corrupt). Open it in your current Live and save it \
+                 (the version shortcut saves it as the next version), then convert that new version."
+            ));
+        }
         let ls = child(root, "LiveSet").ok_or("Not a Live set (no LiveSet element)")?;
         let next_pointee = child(ls, "NextPointeeId").and_then(|n| {
             let r = attr_range(n, "Value")?;
@@ -699,7 +739,7 @@ pub fn analyze(path: &Path, catalog: Option<Vec<Plugin>>) -> Result<Plan, String
         }
         (items, envelopes, next_pointee, max_target_id)
     };
-    Ok(Plan { path: path.to_path_buf(), xml, items, catalog_size: catalog.len(), envelopes, next_pointee, max_target_id })
+    Ok(Plan { path: path.to_path_buf(), xml, items, catalog_size: catalog.len(), envelopes, next_pointee, max_target_id, blocked, format })
 }
 
 // ----------------------------------------------------------------------------- building XML
@@ -742,7 +782,7 @@ fn uid_xml(uid: &[u8; 16], ind: &str, nl: &str) -> String {
     s + &format!("{ind}</Uid>")
 }
 
-fn build_vst3_info(item: &Item, target: &Plugin, state: &[u8], nl: &str) -> String {
+fn build_vst3_info(item: &Item, target: &Plugin, state: &[u8], nl: &str, format: SetFormat) -> String {
     let db = learned();
     let lent = db.get(&hex(&target.uid));
     let inst = target.is_instrument();
@@ -754,9 +794,12 @@ fn build_vst3_info(item: &Item, target: &Plugin, state: &[u8], nl: &str) -> Stri
     let mut s = format!("<Vst3PluginInfo Id=\"{}\">{nl}", esc(&item.info_id));
     s += &format!("{i1}<WinPosX Value=\"{}\" />{nl}", esc(&item.win_x));
     s += &format!("{i1}<WinPosY Value=\"{}\" />{nl}", esc(&item.win_y));
-    s += &format!("{i1}<NumAudioInputs Value=\"{}\" />{nl}", esc(&inputs));
-    s += &format!("{i1}<NumAudioOutputs Value=\"{}\" />{nl}", esc(&outputs));
-    s += &format!("{i1}<IsPlaceholderDevice Value=\"false\" />{nl}");
+    if format == SetFormat::Live12 {
+        // Live 10/11 files don't have these; adding them there could make Live reject the set.
+        s += &format!("{i1}<NumAudioInputs Value=\"{}\" />{nl}", esc(&inputs));
+        s += &format!("{i1}<NumAudioOutputs Value=\"{}\" />{nl}", esc(&outputs));
+        s += &format!("{i1}<IsPlaceholderDevice Value=\"false\" />{nl}");
+    }
     s += &format!("{i1}<Preset>{nl}{i2}<Vst3Preset Id=\"{}\">{nl}", esc(&item.preset_id));
     for c in &item.preset_common {
         s += &format!("{i3}{c}{nl}");
@@ -855,9 +898,16 @@ pub fn preview_report(plan: &Plan) -> Vec<String> {
     if n == 0 {
         return vec![format!("{set} has no VST2 or Audio Unit plug-ins. Nothing to convert.")];
     }
+    let mut out = Vec::new();
+    if let Some(why) = &plan.blocked {
+        out.push(format!("Can't convert {set} yet."));
+        out.push(format!("  {why}"));
+        out.push("  What converting would do once it's saved in a current Live:".into());
+        out.push(String::new());
+    }
     let count = |m: Mode| plan.items.iter().filter(|i| i.target.is_some() && i.mode == m).count();
     let conv = n - plan.items.iter().filter(|i| i.target.is_none() || i.mode == Mode::Skip).count();
-    let mut out = vec![format!("Plug-in report for {set}: {conv} of {n} VST2/AU plug-ins can be converted to VST3")];
+    out.push(format!("Plug-in report for {set}: {conv} of {n} VST2/AU plug-ins can be converted to VST3"));
     let parts: Vec<String> = [
         (Mode::Vst2State, "keeps its settings", "keep their settings"),
         (Mode::Raw, "passes its data as-is (check in Live)", "pass their data as-is (check in Live)"),
@@ -897,6 +947,9 @@ pub fn convert(plan: &Plan, out_path: Option<PathBuf>) -> Result<(PathBuf, Vec<S
     let nl = if xml.contains("\r\n") { "\r\n" } else { "\n" };
     let mut next_id = plan.next_pointee.as_ref().map(|(_, v)| *v).unwrap_or(0).max(plan.max_target_id + 1);
     let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+    if let Some(why) = &plan.blocked {
+        return Err(why.clone());
+    }
     let mut dropped: HashSet<String> = HashSet::new();
     let mut report = Vec::new();
     let mut done = 0;
@@ -930,7 +983,7 @@ pub fn convert(plan: &Plan, out_path: Option<PathBuf>) -> Result<(PathBuf, Vec<S
             edits.push((dev.end..dev.end, format!("{nl}{indent}{clone}")));
         }
 
-        edits.push((item.info.clone(), build_vst3_info(item, target, &state_for(item), nl)));
+        edits.push((item.info.clone(), build_vst3_info(item, target, &state_for(item), nl, plan.format)));
         if item.device_tag != "PluginDevice" {
             let t = &item.device_tag;
             edits.push((dev.start + 1..dev.start + 1 + t.len(), "PluginDevice".into()));
@@ -1014,6 +1067,117 @@ mod tests {
         assert_eq!(normalize("Endless Smile 64"), normalize("Endless Smile"));
         assert_eq!(normalize("ValhallaRoom_x64"), normalize("ValhallaRoom"));
         assert_ne!(normalize("Kick 2 x64"), normalize("Kick 3"));
+    }
+
+    #[test]
+    fn set_formats() {
+        assert_eq!(set_format(Some("4"), Some("9.5_327")), SetFormat::NoVst3); // Live 9.7
+        assert_eq!(set_format(Some("5"), Some("10.0_377")), SetFormat::Live10);
+        assert_eq!(set_format(Some("5"), Some("11.0_436")), SetFormat::Live10);
+        assert_eq!(set_format(Some("5"), Some("12.0_12402")), SetFormat::Live12);
+        assert_eq!(set_format(None, None), SetFormat::NoVst3);
+    }
+
+    /// A minimal set with one ValhallaRoom VST2, saved as the given Live version.
+    fn tiny_set(dir: &Path, name: &str, major: &str, minor: &str, creator: &str) -> PathBuf {
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<Ableton MajorVersion="{major}" MinorVersion="{minor}" Creator="{creator}">
+	<LiveSet>
+		<NextPointeeId Value="100" />
+		<Tracks>
+			<AudioTrack Id="1">
+				<Name>
+					<EffectiveName Value="Verb" />
+				</Name>
+				<DeviceChain>
+					<DeviceChain>
+						<Devices>
+							<PluginDevice Id="0">
+								<On>
+									<Manual Value="true" />
+									<AutomationTarget Id="10" />
+								</On>
+								<UserName Value="" />
+								<PluginDesc>
+									<VstPluginInfo Id="0">
+										<WinPosX Value="1" />
+										<WinPosY Value="2" />
+										<PlugName Value="ValhallaRoom_x64" />
+										<UniqueId Value="1383429485" />
+										<Category Value="1" />
+										<Preset>
+											<VstPreset Id="5">
+												<IsOn Value="true" />
+												<Type Value="1178747752" />
+												<ProgramCount Value="1" />
+												<ProgramNumber Value="0" />
+												<Buffer>56433221</Buffer>
+												<PluginVersion Value="65545" />
+											</VstPreset>
+										</Preset>
+									</VstPluginInfo>
+								</PluginDesc>
+								<ParameterList />
+							</PluginDevice>
+						</Devices>
+					</DeviceChain>
+				</DeviceChain>
+			</AudioTrack>
+		</Tracks>
+	</LiveSet>
+</Ableton>
+"#
+        );
+        let p = dir.join(name);
+        als::write_als(&p, &xml).unwrap();
+        p
+    }
+
+    fn valhalla() -> Vec<Plugin> {
+        let mut uid = [0u8; 16];
+        uid[..7].copy_from_slice(b"VSTRuum");
+        uid[7..].copy_from_slice(b"valhallar");
+        vec![Plugin { uid, name: "ValhallaRoom".into(), vendor: "Valhalla DSP, LLC".into(), kind: "audiofx".into(), dev_id: "device:vst3:audiofx:x".into() }]
+    }
+
+    /// Live 9 had no VST3: converting must refuse instead of writing a set Live calls corrupt.
+    #[test]
+    fn live9_sets_are_not_converted() {
+        let dir = std::env::temp_dir().join(format!("lv-fmt9-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = tiny_set(&dir, "Old Song v_12.als", "4", "9.5_327", "Ableton Live 9.7.4");
+        let plan = analyze(&p, Some(valhalla())).unwrap();
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].mode, Mode::Vst2State, "the plug-in itself is convertible");
+        assert!(plan.blocked.as_deref().unwrap_or("").contains("Ableton Live 9.7.4"));
+        assert!(convert(&plan, Some(dir.join("out.als"))).is_err());
+        assert!(!dir.join("out.als").exists(), "nothing may be written");
+        assert!(preview_report(&plan)[0].starts_with("Can't convert"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Live 10/11 files write VST3 entries without the Live 12 bus-count fields.
+    #[test]
+    fn vst3_entry_matches_the_sets_live_version() {
+        let dir = std::env::temp_dir().join(format!("lv-fmt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (major, minor, creator, live12) in
+            [("5", "11.0_436", "Ableton Live 11.1.6", false), ("5", "12.0_12402", "Ableton Live 12.4.16", true)]
+        {
+            let p = tiny_set(&dir, "Song.als", major, minor, creator);
+            let plan = analyze(&p, Some(valhalla())).unwrap();
+            assert!(plan.blocked.is_none());
+            let out = dir.join("Song v_2.als");
+            convert(&plan, Some(out.clone())).unwrap();
+            let xml = als::read_xml(&out).unwrap();
+            als::parse(&xml).unwrap();
+            assert!(xml.contains("<Vst3PluginInfo"), "{creator}");
+            assert_eq!(xml.contains("<NumAudioInputs"), live12, "{creator}");
+            assert_eq!(xml.contains("<IsPlaceholderDevice"), live12, "{creator}");
+            std::fs::remove_file(&out).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Reads this machine's Live plug-in database if there is one (read-only).
