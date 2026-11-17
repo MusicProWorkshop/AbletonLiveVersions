@@ -29,7 +29,12 @@ use crate::als::{self, child, elements, find, tag, val};
 pub enum Mode {
     Vst2State,
     Raw,
+    /// Effects: VST3 with defaults, the old plug-in kept next to it, switched off.
     SideBySide,
+    /// Instruments: the track is duplicated; the copy gets the VST3 (defaults) and
+    /// plays, the original keeps the old instrument and is muted. (A chain can't
+    /// hold two instruments, so instruments can't use SideBySide.)
+    DuplicateTrack,
     Default,
     Skip,
 }
@@ -40,6 +45,7 @@ impl Mode {
             Mode::Vst2State => "Keep settings (VST3 accepts the VST2 data)",
             Mode::Raw => "Keep settings: pass data as-is (try it)",
             Mode::SideBySide => "Default settings + keep old plug-in (off) to copy settings",
+            Mode::DuplicateTrack => "Duplicate the track: VST3 on the copy, old instrument kept on the original (muted)",
             Mode::Default => "VST3 with default settings",
             Mode::Skip => "Don't convert",
         }
@@ -49,6 +55,7 @@ impl Mode {
             Mode::Vst2State => "Settings kept (VST2-compatible VST3)",
             Mode::Raw => "Old data passed as-is — check in Live",
             Mode::SideBySide => "Defaults + old plug-in kept (off)",
+            Mode::DuplicateTrack => "Track duplicated: VST3 copy + old kept (muted)",
             Mode::Default => "Default settings",
             Mode::Skip => "Not converted",
         }
@@ -58,6 +65,7 @@ impl Mode {
             "vst2state" => Mode::Vst2State,
             "raw" => Mode::Raw,
             "sidebyside" => Mode::SideBySide,
+            "duplicate" => Mode::DuplicateTrack,
             "default" => Mode::Default,
             "skip" => Mode::Skip,
             _ => return None,
@@ -426,7 +434,7 @@ fn find_target(src: &Source, catalog: &[Plugin]) -> (Option<Plugin>, Option<&'st
     (None, None)
 }
 
-fn default_mode(src: &Source, m: Option<&str>) -> (Mode, &'static str) {
+fn default_mode(src: &Source, m: Option<&str>, instrument: bool, can_duplicate: bool) -> (Mode, &'static str) {
     match m {
         None => (Mode::Skip, "No VST3 with this ID or name is installed."),
         Some(_) if src.shell => (Mode::Skip, "Shell plug-in (e.g. Waves): not supported."),
@@ -440,6 +448,18 @@ fn default_mode(src: &Source, m: Option<&str>) -> (Mode, &'static str) {
             }
         }
         _ if src.chunk_kind == "juce" => (Mode::Raw, "JUCE plug-in: its saved state is usually the same in every format."),
+        // An instrument can't get a side-by-side copy: a chain holds only one instrument
+        // (Live crashes opening a set with two in a chain). Duplicate its track instead.
+        _ if instrument && can_duplicate => (
+            Mode::DuplicateTrack,
+            "Instrument with different plug-in IDs: its settings can't be converted. The track is duplicated: the copy \
+             gets the VST3 (default settings), the original keeps the old instrument, muted, to copy settings from.",
+        ),
+        _ if instrument => (
+            Mode::Skip,
+            "Instrument with different plug-in IDs: its sound can't be converted, so it stays VST2. \
+             Pick \"VST3 with default settings\" to replace it anyway.",
+        ),
         _ => (Mode::SideBySide, "Different plug-in IDs: settings can't be converted automatically."),
     }
 }
@@ -489,6 +509,22 @@ pub struct Item {
     user_name_value: Option<Range<usize>>,
     device_id_value: Option<Range<usize>>,
     sibling_max_id: i64,
+    /// The MIDI/audio track the plug-in is on (None on return/main tracks).
+    track_info: Option<TrackInfo>,
+}
+
+/// Where a track is in the file, for duplicating it.
+#[derive(Clone, Debug)]
+struct TrackInfo {
+    range: Range<usize>,
+    id: String,
+    /// Name to build the new names from (UserName, else EffectiveName).
+    name: String,
+    effective: String,
+    effective_name_value: Option<Range<usize>>,
+    user_name_value: Option<Range<usize>>,
+    /// The track activator (DeviceChain/Mixer/Speaker/Manual).
+    speaker_value: Option<Range<usize>>,
 }
 
 impl Item {
@@ -498,6 +534,11 @@ impl Item {
     pub fn new_label(&self) -> String {
         self.target.as_ref().map(|t| format!("{} [VST3]", t.name)).unwrap_or_else(|| "— no VST3 found —".into())
     }
+    /// An instrument (on either side): it can't share a chain with another instrument.
+    pub fn is_instrument(&self) -> bool {
+        self.src.is_instrument || self.target.as_ref().map(|t| t.is_instrument()).unwrap_or(false)
+    }
+
     pub fn modes(&self) -> Vec<Mode> {
         if self.target.is_none() {
             return vec![Mode::Skip];
@@ -509,7 +550,12 @@ impl Item {
         if self.src.chunk.is_some() {
             m.push(Mode::Raw);
         }
-        m.extend([Mode::SideBySide, Mode::Default, Mode::Skip]);
+        if !self.is_instrument() {
+            m.push(Mode::SideBySide);
+        } else if self.track_info.is_some() {
+            m.push(Mode::DuplicateTrack);
+        }
+        m.extend([Mode::Default, Mode::Skip]);
         m
     }
 }
@@ -522,6 +568,8 @@ pub struct Plan {
     envelopes: Vec<(String, Range<usize>)>,
     next_pointee: Option<(Range<usize>, i64)>,
     max_target_id: i64,
+    /// Highest track Id, for new tracks.
+    max_track_id: i64,
     /// Why this set can't be converted as it is (saved by a Live without VST3).
     pub blocked: Option<String>,
     /// Write VST3 entries the way the set's own Live version does.
@@ -635,8 +683,36 @@ fn param_target_ids(p: Node) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Elements whose Id is a "pointee" Id: unique across the whole set (Live refuses a
+/// set with duplicates: "corrupt (non-unique Pointee IDs)"). Found by scanning 100
+/// real sets (Live 10–12) for Id-carrying elements whose Ids never repeat and never
+/// collide with automation targets; list indexes like FloatEvent or WarpMarker
+/// Ids are local and may repeat.
 fn is_pointee_tag(t: &str) -> bool {
-    matches!(t, "AutomationTarget" | "ModulationTarget" | "Pointee") || t.ends_with("ModulationTarget")
+    matches!(t, "AutomationTarget" | "ModulationTarget" | "Pointee" | "RemoteableBool")
+        || t.ends_with("ModulationTarget")
+        || t.strip_prefix("ControllerTargets.").map(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).unwrap_or(false)
+}
+
+fn id_attr_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r#"<([A-Za-z][A-Za-z0-9_]*(?:\.\d+)?) Id="(\d+)""#).unwrap())
+}
+
+/// The check Live does on load: every pointee Id unique. Run on every converted
+/// set before it's written, so a mistake stops the conversion instead.
+fn check_unique_pointees(xml: &str) -> Result<(), String> {
+    let mut seen: HashMap<&str, &str> = HashMap::new();
+    for c in id_attr_re().captures_iter(xml) {
+        let (t, id) = (c.get(1).unwrap().as_str(), c.get(2).unwrap().as_str());
+        if !is_pointee_tag(t) {
+            continue;
+        }
+        if let Some(prev) = seen.insert(id, t) {
+            return Err(format!("internal error: the converted set would have a duplicate pointee Id {id} ({prev} and {t}); nothing was written"));
+        }
+    }
+    Ok(())
 }
 
 pub fn analyze(path: &Path, catalog: Option<Vec<Plugin>>) -> Result<Plan, String> {
@@ -659,7 +735,7 @@ pub fn analyze(path: &Path, catalog: Option<Vec<Plugin>>) -> Result<Plan, String
     let catalog = catalog.unwrap_or_else(load_catalog);
     let layout;
     let mut blocked = None;
-    let (items, envelopes, next_pointee, max_target_id) = {
+    let (items, envelopes, next_pointee, max_target_id, max_track_id) = {
         let doc = als::parse(&xml)?;
         learn_from_doc(&doc);
         save_learned();
@@ -707,13 +783,25 @@ pub fn analyze(path: &Path, catalog: Option<Vec<Plugin>>) -> Result<Plan, String
                 "AuPluginInfo" => au_source(info),
                 _ => continue,
             };
-            let track = dev
-                .ancestors()
-                .find(|a| a.is_element() && tag(*a).ends_with("Track"))
+            let track_node = dev.ancestors().find(|a| a.is_element() && tag(*a).ends_with("Track"));
+            let track = track_node
                 .map(|t| val(t, "Name/EffectiveName").map(String::from).unwrap_or_else(|| tag(t).replace("Track", "")))
                 .unwrap_or_default();
+            let track_info = track_node.filter(|t| matches!(tag(*t), "MidiTrack" | "AudioTrack")).and_then(|t| {
+                let user = val(t, "Name/UserName").unwrap_or("");
+                Some(TrackInfo {
+                    range: t.range(),
+                    id: t.attribute("Id")?.to_string(),
+                    name: if user.trim().is_empty() { val(t, "Name/EffectiveName").unwrap_or("Track").to_string() } else { user.to_string() },
+                    effective: val(t, "Name/EffectiveName").unwrap_or("Track").to_string(),
+                    effective_name_value: value_range(t, "Name/EffectiveName"),
+                    user_name_value: value_range(t, "Name/UserName"),
+                    speaker_value: value_range(t, "DeviceChain/Mixer/Speaker/Manual"),
+                })
+            });
             let (target, match_kind) = find_target(&src, &catalog);
-            let (mode, note) = default_mode(&src, match_kind);
+            let instrument = src.is_instrument || target.as_ref().map(|t| t.is_instrument()).unwrap_or(false);
+            let (mode, note) = default_mode(&src, match_kind, instrument, track_info.is_some());
             let lmap = target.as_ref().and_then(|t| db.get(&hex(&t.uid)));
             let params: Vec<Node> = child(dev, "ParameterList").map(|l| elements(l).collect()).unwrap_or_default();
             let mut recs = Vec::new();
@@ -786,11 +874,26 @@ pub fn analyze(path: &Path, catalog: Option<Vec<Plugin>>) -> Result<Plan, String
                 user_name_value: value_range(dev, "UserName"),
                 device_id_value: attr_range(dev, "Id"),
                 sibling_max_id,
+                track_info,
             });
         }
-        (items, envelopes, next_pointee, max_target_id)
+        let max_track_id = child(ls, "Tracks")
+            .map(|ts| elements(ts).filter_map(|t| t.attribute("Id")?.parse::<i64>().ok()).max().unwrap_or(0))
+            .unwrap_or(0);
+        (items, envelopes, next_pointee, max_target_id, max_track_id)
     };
-    Ok(Plan { path: path.to_path_buf(), xml, items, catalog_size: catalog.len(), envelopes, next_pointee, max_target_id, blocked, layout })
+    Ok(Plan {
+        path: path.to_path_buf(),
+        xml,
+        items,
+        catalog_size: catalog.len(),
+        envelopes,
+        next_pointee,
+        max_target_id,
+        max_track_id,
+        blocked,
+        layout,
+    })
 }
 
 // ----------------------------------------------------------------------------- building XML
@@ -886,6 +989,42 @@ fn state_for(item: &Item) -> Vec<u8> {
     }
 }
 
+/// Give every automation/modulation target in a copied track a fresh Id, and point
+/// the copy's own automation envelopes at the new Ids (two-pass, so envelopes that
+/// come before their targets in the text are mapped too).
+fn renumber_pointees(text: &str, next_id: &mut i64) -> String {
+    static REF: OnceLock<regex::Regex> = OnceLock::new();
+    let def = id_attr_re();
+    let refr = REF.get_or_init(|| regex::Regex::new(r#"<PointeeId Value="(\d+)""#).unwrap());
+    let mut map: HashMap<String, i64> = HashMap::new();
+    for c in def.captures_iter(text).filter(|c| is_pointee_tag(&c[1])) {
+        map.entry(c[2].to_string()).or_insert_with(|| {
+            let v = *next_id;
+            *next_id += 1;
+            v
+        });
+    }
+    let renamed = def.replace_all(text, |c: &regex::Captures| {
+        if is_pointee_tag(&c[1]) { format!("<{} Id=\"{}\"", &c[1], map[&c[2]]) } else { c[0].to_string() }
+    });
+    refr.replace_all(&renamed, |c: &regex::Captures| match map.get(&c[1]) {
+        Some(v) => format!("<PointeeId Value=\"{v}\""),
+        None => c[0].to_string(),
+    })
+    .into_owned()
+}
+
+/// New track Id and name for a copied track (its start tag and its Name block,
+/// which comes before any devices).
+fn set_track_identity(text: &str, id: i64, user_name: &str, effective_name: &str) -> String {
+    let id_re = regex::Regex::new(r#"^(<\w+ Id=")\d+(")"#).unwrap();
+    let text = id_re.replace(text, |c: &regex::Captures| format!("{}{id}{}", &c[1], &c[2]));
+    let eff = regex::Regex::new(r#"<EffectiveName Value="[^"]*""#).unwrap();
+    let text = eff.replace(&text, |_: &regex::Captures| format!("<EffectiveName Value=\"{}\"", esc(effective_name)));
+    let user = regex::Regex::new(r#"<UserName Value="[^"]*""#).unwrap();
+    user.replace(&text, |_: &regex::Captures| format!("<UserName Value=\"{}\"", esc(user_name))).into_owned()
+}
+
 /// Apply non-overlapping (range, replacement) edits to a text.
 fn apply_edits(text: &str, mut edits: Vec<(Range<usize>, String)>) -> Result<String, String> {
     edits.sort_by_key(|(r, _)| (r.start, r.end));
@@ -931,10 +1070,18 @@ fn item_report(item: &Item, lost: &[String]) -> Vec<String> {
     if item.target.is_none() || item.mode == Mode::Skip {
         return vec![format!("  · {}: {} — kept ({})", item.track, item.old_label(), item.note)];
     }
+    let dup;
     let what = match item.mode {
         Mode::Vst2State => "settings kept",
         Mode::Raw => "settings passed as-is — check it",
         Mode::SideBySide => "default settings; old plug-in kept next to it (off)",
+        Mode::DuplicateTrack => {
+            dup = format!(
+                "track duplicated: \"{} (VST3)\" gets the VST3 with default settings, the original keeps the old instrument (muted)",
+                item.track
+            );
+            dup.as_str()
+        }
         _ => "default settings",
     };
     let mut line = format!("  ✓ {}: {} → {} — {what}", item.track, item.old_label(), item.new_label());
@@ -947,7 +1094,8 @@ fn item_report(item: &Item, lost: &[String]) -> Vec<String> {
         if lost.len() > 6 {
             shown += "…";
         }
-        out.push(format!("      lost automation for: {shown} (VST3 parameter IDs not learned yet)"));
+        let where_ = if item.mode == Mode::DuplicateTrack { "; the original track keeps it" } else { "" };
+        out.push(format!("      lost automation for: {shown} (VST3 parameter IDs not learned yet{where_})"));
     }
     out
 }
@@ -975,6 +1123,7 @@ pub fn preview_report(plan: &Plan) -> Vec<String> {
         (Mode::Vst2State, "keeps its settings", "keep their settings"),
         (Mode::Raw, "passes its data as-is (check in Live)", "pass their data as-is (check in Live)"),
         (Mode::SideBySide, "starts from defaults with the old plug-in kept (off)", "start from defaults with the old plug-in kept (off)"),
+        (Mode::DuplicateTrack, "gets a duplicated track (VST3 copy, old one muted)", "get duplicated tracks (VST3 copy, old one muted)"),
         (Mode::Default, "starts from defaults", "start from defaults"),
     ]
     .iter()
@@ -1025,6 +1174,10 @@ pub fn convert(plan: &Plan, out_path: Option<PathBuf>) -> Result<(PathBuf, Vec<S
         };
         let dev = item.device.clone();
 
+        if item.mode == Mode::SideBySide && item.is_instrument() {
+            // Never write two instruments into one chain: Live crashes opening such a set.
+            return Err(format!("{}: an instrument can't be kept side by side with its VST3 (one instrument per chain).", item.old_label()));
+        }
         if item.mode == Mode::SideBySide {
             // Copy of the untouched old device, switched off, with fresh automation IDs.
             let mut sub = Vec::new();
@@ -1088,12 +1241,58 @@ pub fn convert(plan: &Plan, out_path: Option<PathBuf>) -> Result<(PathBuf, Vec<S
             edits.push((r.clone(), String::new()));
         }
     }
+
+    // Instruments in DuplicateTrack mode: every edit inside their track goes to a
+    // copy of the track (which plays); the original keeps the old instrument and
+    // everything else as it was, and is muted and renamed.
+    let mut dups: Vec<(&TrackInfo, &str)> = Vec::new();
+    for item in plan.items.iter().filter(|i| i.mode == Mode::DuplicateTrack && i.target.is_some()) {
+        let t = item.track_info.as_ref().ok_or_else(|| format!("{}: no track to duplicate", item.old_label()))?;
+        if !dups.iter().any(|(d, _)| d.range == t.range) {
+            dups.push((t, item.src.fmt.as_str()));
+        }
+    }
+    let mut next_track_id = plan.max_track_id;
+    for (t, fmt) in dups {
+        // Routings on other tracks (sidechains, resampling…) keep pointing at the original.
+        let routed = xml.match_indices(&format!("Track.{}/", t.id)).any(|(i, _)| i < t.range.start || i > t.range.end);
+        if routed {
+            report.push(format!(
+                "      note: other tracks route audio to or from \"{}\"; those routings still use the original (muted) track",
+                t.effective
+            ));
+        }
+        let (inside, rest): (Vec<_>, Vec<_>) =
+            edits.into_iter().partition(|(r, _)| t.range.start <= r.start && r.end <= t.range.end);
+        edits = rest;
+        let shifted = inside.into_iter().map(|(r, s)| (r.start - t.range.start..r.end - t.range.start, s)).collect();
+        let copy = apply_edits(&xml[t.range.clone()], shifted)?;
+        let copy = renumber_pointees(&copy, &mut next_id);
+        // New track Id from the pointee counter: above every track Id and every pointee Id.
+        next_track_id = next_track_id.max(next_id);
+        next_id = next_track_id + 1;
+        let copy = set_track_identity(&copy, next_track_id, &format!("{} (VST3)", t.name), &format!("{} (VST3)", t.effective));
+        let indent = line_indent(xml, t.range.start);
+        edits.push((t.range.end..t.range.end, format!("{nl}{indent}{copy}")));
+        let old = format!(" (old {fmt}, muted)");
+        if let Some(r) = &t.user_name_value {
+            edits.push((r.clone(), esc(&format!("{}{old}", t.name))));
+        }
+        if let Some(r) = &t.effective_name_value {
+            edits.push((r.clone(), esc(&format!("{}{old}", t.effective))));
+        }
+        if let Some(r) = &t.speaker_value {
+            edits.push((r.clone(), "false".into()));
+        }
+    }
+
     if let Some((r, v)) = &plan.next_pointee {
         edits.push((r.clone(), next_id.max(*v).to_string()));
     }
     let new_xml = apply_edits(xml, edits)?;
     // Never write something Live can't read.
     als::parse(&new_xml).map_err(|e| format!("internal error, the converted set didn't validate: {e}"))?;
+    check_unique_pointees(&new_xml)?;
     let out = out_path.unwrap_or_else(|| crate::versions::next_version_path(&plan.path));
     als::write_als(&out, &new_xml).map_err(|e| format!("Can't write {}: {e}", out.display()))?;
     let mut lines = vec![format!(
@@ -1213,6 +1412,184 @@ mod tests {
         let p = dir.join(name);
         als::write_als(&p, &xml).unwrap();
         p
+    }
+
+    /// Live crashed opening sets where Spire (an instrument) had been kept side by
+    /// side with its VST3: two instruments in one chain.
+    #[test]
+    fn instruments_are_never_copied_side_by_side() {
+        let dir = std::env::temp_dir().join(format!("lv-inst-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = tiny_set(&dir, "Synth.als", "5", "12.0_12402", "Ableton Live 12.4.16");
+        // Turn the effect into a Spire-like instrument: VST2 category 2, non-JUCE state.
+        let xml = als::read_xml(&p)
+            .unwrap()
+            .replace("ValhallaRoom_x64", "Spire-1.5")
+            .replace("1383429485", "1399878194")
+            .replace("<Category Value=\"1\" />", "<Category Value=\"2\" />")
+            .replace("<Buffer>56433221</Buffer>", "<Buffer>00112233</Buffer>");
+        als::write_als(&p, &xml).unwrap();
+        let spire = vec![Plugin { uid: [0x2d; 16], name: "Spire".into(), vendor: "Reveal Sound".into(), kind: "instr".into(), dev_id: "device:vst3:instr:x".into() }];
+        let mut plan = analyze(&p, Some(spire)).unwrap();
+        let it = &plan.items[0];
+        assert_eq!(it.match_kind, Some("name"));
+        assert!(it.is_instrument());
+        assert_eq!(it.mode, Mode::DuplicateTrack, "duplicates its track by default");
+        assert!(!it.modes().contains(&Mode::SideBySide));
+        assert!(it.modes().contains(&Mode::Default));
+        assert!(it.modes().contains(&Mode::Skip));
+        // Forcing a side-by-side copy anyway is refused, nothing written.
+        let out = dir.join("Synth v_2.als");
+        plan.items[0].mode = Mode::SideBySide;
+        assert!(convert(&plan, Some(out.clone())).is_err());
+        assert!(!out.exists());
+        // Default settings: replaced, one instrument in the chain.
+        plan.items[0].mode = Mode::Default;
+        convert(&plan, Some(out.clone())).unwrap();
+        let xml = als::read_xml(&out).unwrap();
+        assert_eq!(xml.matches("<PluginDevice ").count(), 1);
+        assert!(xml.contains("<Vst3PluginInfo"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Duplicate-track mode: the original keeps the old instrument (muted, renamed,
+    /// otherwise untouched); the copy gets the VST3, fresh IDs, and its own automation.
+    #[test]
+    fn instrument_track_is_duplicated() {
+        let dir = std::env::temp_dir().join(format!("lv-dup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Ableton MajorVersion="5" MinorVersion="12.0_12402" Creator="Ableton Live 12.4.16">
+	<LiveSet>
+		<NextPointeeId Value="100" />
+		<Tracks>
+			<MidiTrack Id="5">
+				<Name>
+					<EffectiveName Value="Bass" />
+					<UserName Value="Bass" />
+				</Name>
+				<AutomationEnvelopes>
+					<Envelopes>
+						<AutomationEnvelope Id="0">
+							<EnvelopeTarget>
+								<PointeeId Value="10" />
+							</EnvelopeTarget>
+						</AutomationEnvelope>
+					</Envelopes>
+				</AutomationEnvelopes>
+				<DeviceChain>
+					<Mixer>
+						<Speaker>
+							<Manual Value="true" />
+							<AutomationTarget Id="20" />
+						</Speaker>
+					</Mixer>
+					<MainSequencer>
+						<ClipSlotList>
+							<ClipSlot Id="0">
+								<RemoteableBool Id="31">
+									<LomId Value="0" />
+								</RemoteableBool>
+							</ClipSlot>
+						</ClipSlotList>
+						<MidiControllers>
+							<ControllerTargets.0 Id="30">
+								<LomId Value="0" />
+							</ControllerTargets.0>
+						</MidiControllers>
+					</MainSequencer>
+					<DeviceChain>
+						<Devices>
+							<PluginDevice Id="0">
+								<On>
+									<Manual Value="true" />
+									<AutomationTarget Id="10" />
+								</On>
+								<UserName Value="" />
+								<PluginDesc>
+									<VstPluginInfo Id="0">
+										<PlugName Value="Spire-1.5" />
+										<UniqueId Value="1399878194" />
+										<Category Value="2" />
+										<Preset>
+											<VstPreset Id="5">
+												<Type Value="1178747752" />
+												<Buffer>00112233</Buffer>
+											</VstPreset>
+										</Preset>
+									</VstPluginInfo>
+								</PluginDesc>
+								<ParameterList />
+							</PluginDevice>
+						</Devices>
+					</DeviceChain>
+				</DeviceChain>
+			</MidiTrack>
+			<AudioTrack Id="7">
+				<Name>
+					<EffectiveName Value="Other" />
+				</Name>
+			</AudioTrack>
+		</Tracks>
+	</LiveSet>
+</Ableton>
+"#;
+        let p = dir.join("Song.als");
+        als::write_als(&p, xml).unwrap();
+        let spire = vec![Plugin { uid: [0x2d; 16], name: "Spire".into(), vendor: "Reveal Sound".into(), kind: "instr".into(), dev_id: "device:vst3:instr:x".into() }];
+        let plan = analyze(&p, Some(spire)).unwrap();
+        assert_eq!(plan.items[0].mode, Mode::DuplicateTrack);
+        let out = dir.join("Song v_2.als");
+        let (_, report) = convert(&plan, Some(out.clone())).unwrap();
+        assert!(report.iter().any(|l| l.contains("track duplicated")));
+        let text = als::read_xml(&out).unwrap();
+        let doc = als::parse(&text).unwrap();
+        let tracks: Vec<Node> = elements(find(doc.root_element(), "LiveSet/Tracks").unwrap()).collect();
+        assert_eq!(tracks.iter().map(|t| tag(*t)).collect::<Vec<_>>(), ["MidiTrack", "MidiTrack", "AudioTrack"]);
+        let (orig, copy) = (tracks[0], tracks[1]);
+        assert_eq!(orig.attribute("Id"), Some("5"));
+        let copy_id: i64 = copy.attribute("Id").unwrap().parse().unwrap();
+        assert!(copy_id > 7, "new track Id above the existing ones");
+        // MIDI controller targets and RemoteableBools are pointees too: fresh in the copy
+        let ct = |t: Node| find(t, "DeviceChain/MainSequencer/MidiControllers/ControllerTargets.0").unwrap().attribute("Id").unwrap().to_string();
+        let rb = |t: Node| find(t, "DeviceChain/MainSequencer/ClipSlotList/ClipSlot/RemoteableBool").unwrap().attribute("Id").unwrap().to_string();
+        assert_eq!((ct(orig), rb(orig)), ("30".to_string(), "31".to_string()));
+        assert_ne!(ct(copy), "30");
+        assert_ne!(rb(copy), "31");
+        check_unique_pointees(&text).unwrap();
+        // original: old instrument, muted, renamed, its automation untouched
+        assert_eq!(val(orig, "Name/UserName"), Some("Bass (old VST2, muted)"));
+        assert_eq!(val(orig, "DeviceChain/Mixer/Speaker/Manual"), Some("false"));
+        assert!(orig.descendants().any(|n| tag(n) == "VstPluginInfo"));
+        assert!(!orig.descendants().any(|n| tag(n) == "Vst3PluginInfo"));
+        assert_eq!(val(orig, "AutomationEnvelopes/Envelopes/AutomationEnvelope/EnvelopeTarget/PointeeId"), Some("10"));
+        // copy: VST3, playing, new name, fresh IDs, its envelope follows its own On target
+        assert_eq!(val(copy, "Name/UserName"), Some("Bass (VST3)"));
+        assert_eq!(val(copy, "DeviceChain/Mixer/Speaker/Manual"), Some("true"));
+        assert!(copy.descendants().any(|n| tag(n) == "Vst3PluginInfo"));
+        assert!(!copy.descendants().any(|n| tag(n) == "VstPluginInfo"));
+        let on = find(copy, "DeviceChain/DeviceChain/Devices/PluginDevice/On/AutomationTarget").unwrap().attribute("Id").unwrap();
+        assert_ne!(on, "10");
+        assert_eq!(val(copy, "AutomationEnvelopes/Envelopes/AutomationEnvelope/EnvelopeTarget/PointeeId"), Some(on));
+        // every automation target Id unique, NextPointeeId above them all
+        let ids: Vec<i64> = doc.descendants().filter(|n| tag(*n) == "AutomationTarget").map(|n| n.attribute("Id").unwrap().parse().unwrap()).collect();
+        assert_eq!(ids.len(), ids.iter().collect::<HashSet<_>>().len());
+        let next: i64 = val(find(doc.root_element(), "LiveSet").unwrap(), "NextPointeeId").unwrap().parse().unwrap();
+        assert!(ids.iter().all(|i| *i < next));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pointee_uniqueness_check() {
+        assert!(is_pointee_tag("ControllerTargets.12"));
+        assert!(is_pointee_tag("RemoteableBool"));
+        assert!(is_pointee_tag("GrainSizeModulationTarget"));
+        assert!(!is_pointee_tag("FloatEvent"));
+        assert!(!is_pointee_tag("ControllerTargets."));
+        let ok = r#"<A><AutomationTarget Id="5" /><FloatEvent Id="5" /><ControllerTargets.0 Id="6" /></A>"#;
+        check_unique_pointees(ok).unwrap();
+        let bad = r#"<A><AutomationTarget Id="5" /><ControllerTargets.0 Id="5" /></A>"#;
+        assert!(check_unique_pointees(bad).is_err());
     }
 
     fn valhalla() -> Vec<Plugin> {

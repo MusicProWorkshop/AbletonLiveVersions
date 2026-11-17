@@ -88,8 +88,12 @@ result is saved as the next version with a report in its notes. Per plug-in:
 |---|---|---|
 | Settings kept | The VST3 declares it replaces the VST2 (Valhalla, Soundtoys, Kontakt, Dada Life, Kick 2, …) | Lossless: same data Live/Cubase hand over |
 | Old data passed as-is | Same plug-in name, JUCE-made | Usually works; check it in Live |
-| Defaults + old plug-in kept | Same name, unrelated IDs (Spire, Omnisphere, …) | VST3 with defaults, old plug-in kept next to it switched off so you can copy settings |
+| Defaults + old plug-in kept | An **effect** with the same name but unrelated IDs | VST3 with defaults, old plug-in kept next to it switched off so you can copy settings |
+| Track duplicated | An **instrument** with the same name but unrelated IDs (Spire, Omnisphere, …) | The track is duplicated: the copy (named "… (VST3)") gets the VST3 with defaults and plays; the original keeps the old instrument, its effects, clips and automation, and is muted ("… (old VST2, muted)"). Copy the settings over, then delete the original |
 | Not converted | No matching VST3 installed, or a shell plug-in (Waves) | Unchanged |
+
+A chain can only hold one instrument, so an instrument is never kept side by side with its VST3
+inside the same chain (Live crashes opening such a set); its track is duplicated instead.
 
 You can change the choice per plug-in before converting.
 
