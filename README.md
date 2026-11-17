@@ -12,7 +12,7 @@ One file, `LiveVersions.exe` (about 6 MB). No installer, nothing else to install
    it and says what changed.
 3. Press **Ctrl+Alt+V** (or click the tray icon) to open the **version browser**.
 
-Right-click the tray icon for: version browser, Convert a set to VST3, Settings,
+Right-click the tray icon for: version browser, Plug-in report, Convert a set to VST3, Settings,
 **Start with Windows**, and **Quit**.
 
 If you're in an older version (v_3 while v_6 exists), the shortcut saves **v_7**, so nothing is
@@ -50,7 +50,7 @@ Ignored: knob tweaks, automation curves, small mixer moves, colours, and track r
 
 - **Follow Live**: shows whichever set is open in Live, and refreshes when a new version appears.
 - **Open in Live** (or double-click), **Compare** (Ctrl+click two versions), **Regenerate notes**,
-  **Show in folder**, **Convert to VST3…**
+  **Show in folder**, **Plug-in report**, **Convert to VST3…**
 - **Your notes for this version**: free text, stored in the same .txt and kept when notes are regenerated.
 - Drop any `.als` on the window (or on the exe) to browse its versions.
 
@@ -68,6 +68,12 @@ result is saved as the next version with a report in its notes. Per plug-in:
 
 You can change the choice per plug-in before converting.
 
+**Plug-in report:** to see what converting would do without changing anything, use **Plug-in report**
+in the browser (or *Plug-in report for a set…* in the tray menu), or the **Report** tab of the converter.
+It lists every VST2/AU plug-in with what would happen to it, the same lines the conversion writes
+afterwards, plus a summary (how many keep their settings, how much automation is kept). It updates
+when you change a choice on the Plug-ins tab, and can be copied or saved as a text file.
+
 **Automation, rack macros and MIDI mappings** move to the VST3 when its parameter IDs are known.
 They're learned from any set where you've already used that VST3: automatically, from every set
 the app reads, or in bulk with **Learn parameter IDs from a folder…**. If an ID isn't known, that
@@ -83,6 +89,7 @@ The same exe has a command line (run it from a terminal):
 ```
 LiveVersions notes <set.als>...         (re)write change notes
 LiveVersions diff <old.als> <new.als>   print what changed
+LiveVersions report <set.als>           plug-in report: what converting would do (changes nothing)
 LiveVersions vst3 <set.als> [--dry-run] [--out <path>] [--mode "<plugin>=<mode>"]
 LiveVersions learn <folder>...          learn VST3 parameter IDs from sets
 ```
