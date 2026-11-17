@@ -4,3 +4,4 @@ __pycache__/
 *.als.tmp
 # Copies of real Live sets used for local testing; not for the repository.
 /testdata
+/THIRD-PARTY-NOTICES.txt

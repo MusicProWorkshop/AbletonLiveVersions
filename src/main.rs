@@ -30,8 +30,12 @@ Usage:
   LiveVersions versions <set.als | folder>  list versions and the next version's name
   LiveVersions report <set.als>         which plug-ins can be converted to VST3 (changes nothing)
   LiveVersions vst3 <set.als> [--dry-run] [--out <path>] [--mode <plugin>=<mode>]...
-        modes: vst2state raw sidebyside default skip
-  LiveVersions learn <folder>...        learn VST3 parameter IDs from sets";
+        modes: vst2state raw sidebyside duplicate default skip
+  LiveVersions learn <folder>...        learn VST3 parameter IDs from sets
+
+Copyright (C) 2026 MusicProWorkshop. This program comes with ABSOLUTELY NO WARRANTY.
+It is free software under the GNU GPL v3 or later; you may redistribute it under its terms.
+Source and license: https://github.com/MusicProWorkshop/AbletonLiveVersions";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

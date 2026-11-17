@@ -160,11 +160,33 @@ Releases are built and published by the **Release** workflow (`.github/workflows
    *Draft a new release* page with a new tag).
 
 The workflow checks that the tag matches `Cargo.toml` and that the notes file exists, runs the
-tests, builds the exe, checks the exe's own version, and publishes `LiveVersions.exe` and its
-SHA-256. The install/update section of the notes comes from `.github/release-notes/_install.md`.
+tests, builds the exe, checks the exe's own version, and publishes `LiveVersions.exe`, its
+SHA-256 and `THIRD-PARTY-NOTICES.txt` (the licenses of the libraries and fonts built into the exe,
+made by `tools/third-party-notices.ps1`). The install/update section of the notes comes from
+`.github/release-notes/_install.md`.
 *Run workflow* on the Actions page does a dry run: same build, nothing published, the exe is
 attached to the run.
 
 Source: `src/als.rs` (read sets, snapshot), `changes.rs` (diff), `versions.rs` (v_N naming,
 notes), `vst3.rs` (converter), `sqlite.rs` (reads Live's plug-in database), `gui.rs` (windows),
 `win/` (tray, hotkeys, pop-up, Save As automation).
+
+## License
+
+Copyright (C) 2026 MusicProWorkshop
+
+Live Versions is free software: you can redistribute it and/or modify it under the terms of the
+[GNU General Public License](LICENSE) as published by the Free Software Foundation, either version 3
+of the License, or (at your option) any later version. It is distributed in the hope that it will be
+useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+In short: you can use it, share it and change it, and if you distribute a changed version, its
+source must be available under the same license.
+
+The libraries and fonts built into the exe have their own (permissive) licenses, listed in
+`THIRD-PARTY-NOTICES.txt` with each release.
+
+Live Versions is not affiliated with or endorsed by Ableton. Ableton and Ableton Live are
+trademarks of Ableton AG. VST is a trademark of Steinberg Media Technologies GmbH. Audio Units is a
+trademark of Apple Inc.

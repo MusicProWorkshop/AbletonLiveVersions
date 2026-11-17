@@ -7,3 +7,5 @@
 Windows may show a SmartScreen warning because the exe isn't signed: click **More info → Run anyway**.
 
 SHA-256: `{SHA256}`
+
+Live Versions is free software under the [GNU GPL v3 or later](https://github.com/MusicProWorkshop/AbletonLiveVersions/blob/main/LICENSE). `THIRD-PARTY-NOTICES.txt` lists the licenses of the libraries and fonts built into it.
