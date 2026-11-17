@@ -41,7 +41,7 @@ pub fn run(start: Start) {
         s => s,
     };
     let (title, size) = match &start {
-        Start::Settings => ("Live Versions — Settings", [660.0, 470.0]),
+        Start::Settings => ("Live Versions — Settings", [720.0, 600.0]),
         Start::Convert(_) | Start::Report(_) => ("Live Versions — Convert to VST3", [1120.0, 640.0]),
         Start::Browser(_) => ("Live Versions", [1200.0, 720.0]),
     };
@@ -1098,6 +1098,34 @@ impl App {
                     };
                 });
                 ui.end_row();
+                ui.label("New version names");
+                ui.vertical(|ui| {
+                    let current = VERSION_PRESETS
+                        .iter()
+                        .find(|(p, _)| *p == s.cfg.version_format)
+                        .map(|(_, l)| l.to_string())
+                        .unwrap_or_else(|| "Custom".into());
+                    egui::ComboBox::from_id_salt("vfmt").selected_text(current).width(300.0).show_ui(ui, |ui| {
+                        for (p, l) in VERSION_PRESETS {
+                            ui.selectable_value(&mut s.cfg.version_format, p.to_string(), *l);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Pattern").color(DIM));
+                        ui.add(egui::TextEdit::singleline(&mut s.cfg.version_format).desired_width(110.0).font(egui::TextStyle::Monospace));
+                        match version_format_error(&s.cfg) {
+                            Some(e) => ui.label(RichText::new(e).color(BAD).small()),
+                            None => {
+                                let f = versions::configured_format(&s.cfg);
+                                ui.label(RichText::new(format!("My Song{}.als", f.render(2))).color(GOOD))
+                            }
+                        };
+                    });
+                    ui.label(RichText::new("The text between the name and the number, then one # per digit (## = 02).").color(DIM).small());
+                    ui.checkbox(&mut s.cfg.keep_existing_format, "Keep the format a set already uses")
+                        .on_hover_text("A set without a number takes the format of its other versions, else the one used most recently in its folder");
+                });
+                ui.end_row();
                 ui.label("Change notes go");
                 ui.vertical(|ui| {
                     ui.radio_value(&mut s.cfg.notes_location, "subfolder".to_string(), "in a subfolder of the project:");
@@ -1116,7 +1144,9 @@ impl App {
             });
             ui.add_space(18.0);
             ui.horizontal(|ui| {
-                let ok = hk_err(&s.cfg.hotkey_save_version).is_none() && hk_err(&s.cfg.hotkey_open_browser).is_none();
+                let ok = hk_err(&s.cfg.hotkey_save_version).is_none()
+                    && hk_err(&s.cfg.hotkey_open_browser).is_none()
+                    && version_format_error(&s.cfg).is_none();
                 if ui.add_enabled(ok, accent_button("Save")).clicked() {
                     config::save(&s.cfg);
                     #[cfg(windows)]
@@ -1142,6 +1172,28 @@ impl App {
                 self.screen = Screen::Browser;
             }
         }
+    }
+}
+
+/// Version name presets: (pattern, how it looks).
+const VERSION_PRESETS: &[(&str, &str)] = &[
+    (" v_#", "Song v_2"),
+    ("_#", "Song_2  (Live Enhancement Suite)"),
+    (" v#", "Song v2"),
+    (" v###", "Song v002"),
+    (" T##", "Song T02"),
+];
+
+/// Why a version pattern can't be used, if it can't.
+fn version_format_error(cfg: &config::Config) -> Option<String> {
+    let Some(f) = versions::VersionFormat::from_pattern(&cfg.version_format) else {
+        return Some("End with one # per digit, e.g.  v_#  or  T##".into());
+    };
+    // Names made with it must be recognised as versions again, or they'd stop grouping.
+    let name = format!("My Song{}", f.render(2));
+    match versions::split_version(&name, &versions::words(cfg)) {
+        Some((base, _, 2, _)) if base == "My Song" => None,
+        _ => Some(format!("\"{name}\" wouldn't be recognised as a version")),
     }
 }
 

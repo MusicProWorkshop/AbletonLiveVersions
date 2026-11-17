@@ -16,6 +16,12 @@ pub struct Config {
     pub auto_write_missing_notes: bool,
     /// Seconds to wait for Live to finish writing a big set after Save As.
     pub save_timeout_seconds: u64,
+    /// Default version name format: the text between the set's name and the
+    /// number, then one "#" per digit. " v_#" -> "Song v_2", "_#" -> "Song_2",
+    /// " v###" -> "Song v002", " T##" -> "Song T02".
+    pub version_format: String,
+    /// Keep the format a set (or its folder) already uses for new versions.
+    pub keep_existing_format: bool,
     pub les_warning_shown: bool,
 }
 
@@ -28,6 +34,8 @@ impl Default for Config {
             notes_subfolder: "Version Notes".into(),
             auto_write_missing_notes: true,
             save_timeout_seconds: 120,
+            version_format: " v_#".into(),
+            keep_existing_format: true,
             les_warning_shown: false,
         }
     }

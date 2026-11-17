@@ -18,6 +18,21 @@ Right-click the tray icon for: version browser, Plug-in report, Convert a set to
 If you're in an older version (v_3 while v_6 exists), the shortcut saves **v_7**, so nothing is
 ever overwritten. Running the exe a second time just opens the browser.
 
+### Version name formats
+
+Recognised: `Song v_3`, `Song_3` (Live Enhancement Suite), `Song v3`, `Song v003`, `Song T03`,
+`Song Take 3`, and the words `ver`, `version`, `rev`, `r`. Dates (`2026-11-13`) and names like
+`Kick 2` aren't versions. The format of each new version is chosen in this order:
+
+1. the format of the set you're in (`Song T02` → `Song T03`, `Song v009` → `Song v010`);
+2. for a set without a number: the format of its other versions;
+3. else the format of the most recently saved version in the same folder;
+4. else your default from **Settings → New version names** (presets, or your own pattern:
+   the text before the number, then one `#` per digit, e.g. ` v_#` or ` T##`).
+
+Numbers continue across formats. Turn off **Keep the format a set already uses** to always use
+your default.
+
 > Live Enhancement Suite also saves versions on Ctrl+Alt+S. Turn that off in LES, or pick another
 > shortcut in Settings. The app warns you once if it sees LES running.
 
@@ -89,6 +104,7 @@ The same exe has a command line (run it from a terminal):
 ```
 LiveVersions notes <set.als>...         (re)write change notes
 LiveVersions diff <old.als> <new.als>   print what changed
+LiveVersions versions <set.als|folder>  list versions and what the next one will be called
 LiveVersions report <set.als>           plug-in report: what converting would do (changes nothing)
 LiveVersions vst3 <set.als> [--dry-run] [--out <path>] [--mode "<plugin>=<mode>"]
 LiveVersions learn <folder>...          learn VST3 parameter IDs from sets
