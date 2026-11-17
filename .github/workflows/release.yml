@@ -7,7 +7,8 @@
 #
 # The workflow checks that the tag matches Cargo.toml, runs the tests, builds the
 # exe, checks the exe's own version, and publishes LiveVersions.exe plus its
-# SHA-256 with the release notes and the standard install/update section.
+# SHA-256 and THIRD-PARTY-NOTICES.txt, with the release notes and the standard
+# install/update section.
 #
 # "Run workflow" (manual) does a dry run: same checks and build, the exe is
 # attached to the run as an artifact, nothing is published.
@@ -88,6 +89,9 @@ jobs:
           Set-Content out/LiveVersions.exe.sha256 "$hash *LiveVersions.exe" -Encoding ascii -NoNewline
           "LiveVersions.exe $want  ($([math]::Round($exe.Length / 1MB, 2)) MB)  SHA-256 $hash"
 
+      - name: Third-party notices
+        run: ./tools/third-party-notices.ps1 -Out out/THIRD-PARTY-NOTICES.txt
+
       - name: Release notes
         run: |
           $ver = "${{ steps.version.outputs.version }}"
@@ -114,9 +118,9 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             # A release was already created for this tag (e.g. from the GitHub page): fill it in.
             gh release edit $tag --notes-file out/release-notes.md
-            gh release upload $tag "out/LiveVersions.exe#LiveVersions.exe (Windows, 64-bit)" out/LiveVersions.exe.sha256 --clobber
+            gh release upload $tag "out/LiveVersions.exe#LiveVersions.exe (Windows, 64-bit)" out/LiveVersions.exe.sha256 out/THIRD-PARTY-NOTICES.txt --clobber
           } else {
-            gh release create $tag "out/LiveVersions.exe#LiveVersions.exe (Windows, 64-bit)" out/LiveVersions.exe.sha256 `
+            gh release create $tag "out/LiveVersions.exe#LiveVersions.exe (Windows, 64-bit)" out/LiveVersions.exe.sha256 out/THIRD-PARTY-NOTICES.txt `
               --title "Live Versions $ver" --notes-file out/release-notes.md --verify-tag
           }
           gh release view $tag --json url --jq .url

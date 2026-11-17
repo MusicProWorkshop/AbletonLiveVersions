@@ -8,6 +8,7 @@ fn main() {
         res.set_manifest_file("assets/app.manifest");
         res.set("ProductName", "Live Versions");
         res.set("FileDescription", "Live Versions — version manager for Ableton Live sets");
+        res.set("LegalCopyright", "Copyright © 2026 MusicProWorkshop. GPL-3.0-or-later.");
         res.compile().expect("failed to embed Windows resources");
     }
 }
