@@ -683,8 +683,36 @@ fn param_target_ids(p: Node) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Elements whose Id is a "pointee" Id: unique across the whole set (Live refuses a
+/// set with duplicates: "corrupt (non-unique Pointee IDs)"). Found by scanning 100
+/// real sets (Live 10–12) for Id-carrying elements whose Ids never repeat and never
+/// collide with automation targets; list indexes like FloatEvent or WarpMarker
+/// Ids are local and may repeat.
 fn is_pointee_tag(t: &str) -> bool {
-    matches!(t, "AutomationTarget" | "ModulationTarget" | "Pointee") || t.ends_with("ModulationTarget")
+    matches!(t, "AutomationTarget" | "ModulationTarget" | "Pointee" | "RemoteableBool")
+        || t.ends_with("ModulationTarget")
+        || t.strip_prefix("ControllerTargets.").map(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).unwrap_or(false)
+}
+
+fn id_attr_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r#"<([A-Za-z][A-Za-z0-9_]*(?:\.\d+)?) Id="(\d+)""#).unwrap())
+}
+
+/// The check Live does on load: every pointee Id unique. Run on every converted
+/// set before it's written, so a mistake stops the conversion instead.
+fn check_unique_pointees(xml: &str) -> Result<(), String> {
+    let mut seen: HashMap<&str, &str> = HashMap::new();
+    for c in id_attr_re().captures_iter(xml) {
+        let (t, id) = (c.get(1).unwrap().as_str(), c.get(2).unwrap().as_str());
+        if !is_pointee_tag(t) {
+            continue;
+        }
+        if let Some(prev) = seen.insert(id, t) {
+            return Err(format!("internal error: the converted set would have a duplicate pointee Id {id} ({prev} and {t}); nothing was written"));
+        }
+    }
+    Ok(())
 }
 
 pub fn analyze(path: &Path, catalog: Option<Vec<Plugin>>) -> Result<Plan, String> {
@@ -965,19 +993,20 @@ fn state_for(item: &Item) -> Vec<u8> {
 /// the copy's own automation envelopes at the new Ids (two-pass, so envelopes that
 /// come before their targets in the text are mapped too).
 fn renumber_pointees(text: &str, next_id: &mut i64) -> String {
-    static DEF: OnceLock<regex::Regex> = OnceLock::new();
     static REF: OnceLock<regex::Regex> = OnceLock::new();
-    let def = DEF.get_or_init(|| regex::Regex::new(r#"<(AutomationTarget|ModulationTarget|Pointee|[A-Za-z]+ModulationTarget) Id="(\d+)""#).unwrap());
+    let def = id_attr_re();
     let refr = REF.get_or_init(|| regex::Regex::new(r#"<PointeeId Value="(\d+)""#).unwrap());
     let mut map: HashMap<String, i64> = HashMap::new();
-    for c in def.captures_iter(text) {
+    for c in def.captures_iter(text).filter(|c| is_pointee_tag(&c[1])) {
         map.entry(c[2].to_string()).or_insert_with(|| {
             let v = *next_id;
             *next_id += 1;
             v
         });
     }
-    let renamed = def.replace_all(text, |c: &regex::Captures| format!("<{} Id=\"{}\"", &c[1], map[&c[2]]));
+    let renamed = def.replace_all(text, |c: &regex::Captures| {
+        if is_pointee_tag(&c[1]) { format!("<{} Id=\"{}\"", &c[1], map[&c[2]]) } else { c[0].to_string() }
+    });
     refr.replace_all(&renamed, |c: &regex::Captures| match map.get(&c[1]) {
         Some(v) => format!("<PointeeId Value=\"{v}\""),
         None => c[0].to_string(),
@@ -1239,7 +1268,9 @@ pub fn convert(plan: &Plan, out_path: Option<PathBuf>) -> Result<(PathBuf, Vec<S
         let shifted = inside.into_iter().map(|(r, s)| (r.start - t.range.start..r.end - t.range.start, s)).collect();
         let copy = apply_edits(&xml[t.range.clone()], shifted)?;
         let copy = renumber_pointees(&copy, &mut next_id);
-        next_track_id += 1;
+        // New track Id from the pointee counter: above every track Id and every pointee Id.
+        next_track_id = next_track_id.max(next_id);
+        next_id = next_track_id + 1;
         let copy = set_track_identity(&copy, next_track_id, &format!("{} (VST3)", t.name), &format!("{} (VST3)", t.effective));
         let indent = line_indent(xml, t.range.start);
         edits.push((t.range.end..t.range.end, format!("{nl}{indent}{copy}")));
@@ -1261,6 +1292,7 @@ pub fn convert(plan: &Plan, out_path: Option<PathBuf>) -> Result<(PathBuf, Vec<S
     let new_xml = apply_edits(xml, edits)?;
     // Never write something Live can't read.
     als::parse(&new_xml).map_err(|e| format!("internal error, the converted set didn't validate: {e}"))?;
+    check_unique_pointees(&new_xml)?;
     let out = out_path.unwrap_or_else(|| crate::versions::next_version_path(&plan.path));
     als::write_als(&out, &new_xml).map_err(|e| format!("Can't write {}: {e}", out.display()))?;
     let mut lines = vec![format!(
@@ -1452,6 +1484,20 @@ mod tests {
 							<AutomationTarget Id="20" />
 						</Speaker>
 					</Mixer>
+					<MainSequencer>
+						<ClipSlotList>
+							<ClipSlot Id="0">
+								<RemoteableBool Id="31">
+									<LomId Value="0" />
+								</RemoteableBool>
+							</ClipSlot>
+						</ClipSlotList>
+						<MidiControllers>
+							<ControllerTargets.0 Id="30">
+								<LomId Value="0" />
+							</ControllerTargets.0>
+						</MidiControllers>
+					</MainSequencer>
 					<DeviceChain>
 						<Devices>
 							<PluginDevice Id="0">
@@ -1499,8 +1545,18 @@ mod tests {
         let text = als::read_xml(&out).unwrap();
         let doc = als::parse(&text).unwrap();
         let tracks: Vec<Node> = elements(find(doc.root_element(), "LiveSet/Tracks").unwrap()).collect();
-        assert_eq!(tracks.iter().map(|t| (tag(*t), t.attribute("Id").unwrap())).collect::<Vec<_>>(), [("MidiTrack", "5"), ("MidiTrack", "8"), ("AudioTrack", "7")]);
+        assert_eq!(tracks.iter().map(|t| tag(*t)).collect::<Vec<_>>(), ["MidiTrack", "MidiTrack", "AudioTrack"]);
         let (orig, copy) = (tracks[0], tracks[1]);
+        assert_eq!(orig.attribute("Id"), Some("5"));
+        let copy_id: i64 = copy.attribute("Id").unwrap().parse().unwrap();
+        assert!(copy_id > 7, "new track Id above the existing ones");
+        // MIDI controller targets and RemoteableBools are pointees too: fresh in the copy
+        let ct = |t: Node| find(t, "DeviceChain/MainSequencer/MidiControllers/ControllerTargets.0").unwrap().attribute("Id").unwrap().to_string();
+        let rb = |t: Node| find(t, "DeviceChain/MainSequencer/ClipSlotList/ClipSlot/RemoteableBool").unwrap().attribute("Id").unwrap().to_string();
+        assert_eq!((ct(orig), rb(orig)), ("30".to_string(), "31".to_string()));
+        assert_ne!(ct(copy), "30");
+        assert_ne!(rb(copy), "31");
+        check_unique_pointees(&text).unwrap();
         // original: old instrument, muted, renamed, its automation untouched
         assert_eq!(val(orig, "Name/UserName"), Some("Bass (old VST2, muted)"));
         assert_eq!(val(orig, "DeviceChain/Mixer/Speaker/Manual"), Some("false"));
@@ -1521,6 +1577,19 @@ mod tests {
         let next: i64 = val(find(doc.root_element(), "LiveSet").unwrap(), "NextPointeeId").unwrap().parse().unwrap();
         assert!(ids.iter().all(|i| *i < next));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pointee_uniqueness_check() {
+        assert!(is_pointee_tag("ControllerTargets.12"));
+        assert!(is_pointee_tag("RemoteableBool"));
+        assert!(is_pointee_tag("GrainSizeModulationTarget"));
+        assert!(!is_pointee_tag("FloatEvent"));
+        assert!(!is_pointee_tag("ControllerTargets."));
+        let ok = r#"<A><AutomationTarget Id="5" /><FloatEvent Id="5" /><ControllerTargets.0 Id="6" /></A>"#;
+        check_unique_pointees(ok).unwrap();
+        let bad = r#"<A><AutomationTarget Id="5" /><ControllerTargets.0 Id="5" /></A>"#;
+        assert!(check_unique_pointees(bad).is_err());
     }
 
     fn valhalla() -> Vec<Plugin> {
