@@ -807,6 +807,90 @@ fn apply_edits(text: &str, mut edits: Vec<(Range<usize>, String)>) -> Result<Str
     Ok(out)
 }
 
+/// Automated or mapped parameters whose VST3 ID isn't known: converting drops
+/// their automation (rather than letting it drive the wrong parameter).
+fn lost_params(item: &Item, db: &HashMap<String, LearnedEntry>) -> Vec<String> {
+    let Some(target) = item.target.as_ref().filter(|_| item.mode != Mode::Skip) else { return vec![] };
+    let lmap = db.get(&hex(&target.uid)).map(|e| &e.params);
+    item.params
+        .iter()
+        .filter(|p| p.mapped && !lmap.map(|m| m.contains_key(&p.key)).unwrap_or(false))
+        .map(|p| p.key.clone())
+        .collect()
+}
+
+/// Report lines for one plug-in. Used both by the preview and after converting,
+/// so the preview says exactly what converting will do.
+fn item_report(item: &Item, lost: &[String]) -> Vec<String> {
+    if item.target.is_none() || item.mode == Mode::Skip {
+        return vec![format!("  · {}: {} — kept ({})", item.track, item.old_label(), item.note)];
+    }
+    let what = match item.mode {
+        Mode::Vst2State => "settings kept",
+        Mode::Raw => "settings passed as-is — check it",
+        Mode::SideBySide => "default settings; old plug-in kept next to it (off)",
+        _ => "default settings",
+    };
+    let mut line = format!("  ✓ {}: {} → {} — {what}", item.track, item.old_label(), item.new_label());
+    if !item.automated.is_empty() {
+        line += &format!("; automation/mappings kept for {}/{} parameters", item.automated.len() - lost.len(), item.automated.len());
+    }
+    let mut out = vec![line];
+    if !lost.is_empty() {
+        let mut shown = lost.iter().take(6).cloned().collect::<Vec<_>>().join(", ");
+        if lost.len() > 6 {
+            shown += "…";
+        }
+        out.push(format!("      lost automation for: {shown} (VST3 parameter IDs not learned yet)"));
+    }
+    out
+}
+
+/// What converting would do with the current choices, without changing anything:
+/// a short summary followed by the same per-plug-in lines the conversion reports.
+pub fn preview_report(plan: &Plan) -> Vec<String> {
+    let db = learned().clone();
+    let set = plan.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let n = plan.items.len();
+    if n == 0 {
+        return vec![format!("{set} has no VST2 or Audio Unit plug-ins. Nothing to convert.")];
+    }
+    let count = |m: Mode| plan.items.iter().filter(|i| i.target.is_some() && i.mode == m).count();
+    let conv = n - plan.items.iter().filter(|i| i.target.is_none() || i.mode == Mode::Skip).count();
+    let mut out = vec![format!("Plug-in report for {set}: {conv} of {n} VST2/AU plug-ins can be converted to VST3")];
+    let parts: Vec<String> = [
+        (Mode::Vst2State, "keeps its settings", "keep their settings"),
+        (Mode::Raw, "passes its data as-is (check in Live)", "pass their data as-is (check in Live)"),
+        (Mode::SideBySide, "starts from defaults with the old plug-in kept (off)", "start from defaults with the old plug-in kept (off)"),
+        (Mode::Default, "starts from defaults", "start from defaults"),
+    ]
+    .iter()
+    .filter_map(|(m, one, many)| {
+        let c = count(*m);
+        (c > 0).then(|| format!("{c} {}", if c == 1 { one } else { many }))
+    })
+    .collect();
+    if !parts.is_empty() {
+        out.push(format!("  {}", parts.join(" · ")));
+    }
+    let (auto, lost): (usize, usize) = plan
+        .items
+        .iter()
+        .filter(|i| i.target.is_some() && i.mode != Mode::Skip)
+        .map(|i| (i.automated.len(), lost_params(i, &db).len()))
+        .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+    if auto > 0 {
+        let noun = if auto == 1 { "parameter" } else { "parameters" };
+        out.push(format!("  Automation/mappings: {} of {auto} {noun} would be kept", auto - lost));
+    }
+    out.push("  Nothing has been changed yet.".into());
+    out.push(String::new());
+    for item in &plan.items {
+        out.extend(item_report(item, &lost_params(item, &db)));
+    }
+    out
+}
+
 /// Apply the plan to a copy of the set. Returns (output path, report lines).
 pub fn convert(plan: &Plan, out_path: Option<PathBuf>) -> Result<(PathBuf, Vec<String>), String> {
     let xml = &plan.xml;
@@ -819,8 +903,8 @@ pub fn convert(plan: &Plan, out_path: Option<PathBuf>) -> Result<(PathBuf, Vec<S
     let db = learned().clone();
 
     for item in &plan.items {
+        report.extend(item_report(item, &lost_params(item, &db)));
         let Some(target) = item.target.as_ref().filter(|_| item.mode != Mode::Skip) else {
-            report.push(format!("  · {}: {} — kept ({})", item.track, item.old_label(), item.note));
             continue;
         };
         let dev = item.device.clone();
@@ -863,7 +947,6 @@ pub fn convert(plan: &Plan, out_path: Option<PathBuf>) -> Result<(PathBuf, Vec<S
         }
         // Re-key parameters to VST3 IDs; drop the ones we can't map.
         let lmap = db.get(&hex(&target.uid)).map(|e| &e.params);
-        let mut lost = Vec::new();
         for p in &item.params {
             match lmap.and_then(|m| m.get(&p.key)) {
                 Some((pid, flank)) => {
@@ -875,31 +958,10 @@ pub fn convert(plan: &Plan, out_path: Option<PathBuf>) -> Result<(PathBuf, Vec<S
                     }
                 }
                 None => {
-                    if p.mapped {
-                        lost.push(p.key.clone());
-                    }
                     dropped.extend(p.target_ids.iter().cloned());
                     edits.push((p.remove.clone(), String::new()));
                 }
             }
-        }
-        let what = match item.mode {
-            Mode::Vst2State => "settings kept",
-            Mode::Raw => "settings passed as-is — check it",
-            Mode::SideBySide => "default settings; old plug-in kept next to it (off)",
-            _ => "default settings",
-        };
-        let mut line = format!("  ✓ {}: {} → {} — {what}", item.track, item.old_label(), item.new_label());
-        if !item.automated.is_empty() {
-            line += &format!("; automation/mappings kept for {}/{} parameters", item.automated.len() - lost.len(), item.automated.len());
-        }
-        report.push(line);
-        if !lost.is_empty() {
-            let mut shown = lost.iter().take(6).cloned().collect::<Vec<_>>().join(", ");
-            if lost.len() > 6 {
-                shown += "…";
-            }
-            report.push(format!("      lost automation for: {shown} (VST3 parameter IDs not learned yet)"));
         }
         done += 1;
     }

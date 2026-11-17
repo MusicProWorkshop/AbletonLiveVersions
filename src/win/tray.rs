@@ -30,6 +30,7 @@ const ID_SETTINGS: usize = 12;
 const ID_STARTUP: usize = 13;
 const ID_QUIT: usize = 14;
 const ID_NOTES_HELP: usize = 15;
+const ID_REPORT: usize = 16;
 
 enum Event {
     Balloon { title: String, body: String, error: bool },
@@ -194,6 +195,7 @@ fn show_menu(hwnd: HWND, cfg: &config::Config) -> usize {
         item(MF_STRING | MF_GRAYED, 0, "Live Versions is running");
         let _ = AppendMenuW(m, MF_SEPARATOR, 0, PCWSTR::null());
         item(MF_STRING, ID_BROWSE, &format!("Open version browser\t{}", pretty_hotkey(&cfg.hotkey_open_browser)));
+        item(MF_STRING, ID_REPORT, "Plug-in report for a set…");
         item(MF_STRING, ID_CONVERT, "Convert a set to VST3…");
         item(MF_STRING, ID_NOTES_HELP, &format!("How to save a version: {} in Live", pretty_hotkey(&cfg.hotkey_save_version)));
         let _ = AppendMenuW(m, MF_SEPARATOR, 0, PCWSTR::null());
@@ -240,6 +242,9 @@ fn handle_command(st: &mut State, id: usize) {
         ID_BROWSE => open_browser(st),
         ID_CONVERT => {
             spawn_self(&["--convert"]);
+        }
+        ID_REPORT => {
+            spawn_self(&["--report"]);
         }
         ID_SETTINGS => {
             spawn_self(&["--settings"]);

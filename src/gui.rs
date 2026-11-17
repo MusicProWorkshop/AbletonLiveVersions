@@ -23,6 +23,8 @@ const BAD: Color32 = Color32::from_rgb(0xe8, 0x8b, 0x8b);
 pub enum Start {
     Browser(Option<PathBuf>),
     Convert(Option<PathBuf>),
+    /// The converter, opened on its Report tab.
+    Report(Option<PathBuf>),
     Settings,
 }
 
@@ -32,11 +34,15 @@ pub fn run(start: Start) {
             Some(p) => Start::Convert(Some(p)),
             None => return,
         },
+        Start::Report(None) => match pick_set() {
+            Some(p) => Start::Report(Some(p)),
+            None => return,
+        },
         s => s,
     };
     let (title, size) = match &start {
         Start::Settings => ("Live Versions — Settings", [660.0, 470.0]),
-        Start::Convert(_) => ("Live Versions — Convert to VST3", [1120.0, 640.0]),
+        Start::Convert(_) | Start::Report(_) => ("Live Versions — Convert to VST3", [1120.0, 640.0]),
         Start::Browser(_) => ("Live Versions", [1200.0, 720.0]),
     };
     let icon = egui::IconData { rgba: include_bytes!("../assets/icon64.rgba").to_vec(), width: 64, height: 64 };
@@ -195,6 +201,10 @@ struct ConvertUi {
     sel: usize,
     busy: Option<String>,
     result: Option<(PathBuf, Vec<String>)>,
+    /// Showing the "Report" tab (what converting would do) instead of the table.
+    report_view: bool,
+    /// Small status next to the report buttons ("Report copied").
+    busy_note: Option<String>,
 }
 
 struct SettingsUi {
@@ -296,9 +306,13 @@ impl App {
             }
             Start::Convert(Some(p)) => {
                 app.only_screen = true;
-                app.open_convert(p);
+                app.open_convert(p, false);
             }
-            Start::Convert(None) => {}
+            Start::Report(Some(p)) => {
+                app.only_screen = true;
+                app.open_convert(p, true);
+            }
+            Start::Convert(None) | Start::Report(None) => {}
             Start::Settings => {
                 app.only_screen = true;
                 app.open_settings();
@@ -493,8 +507,8 @@ impl App {
                 }
                 Msg::Learned(n) => {
                     self.status = format!("Learned {n} parameter IDs");
-                    if let Some(p) = self.conv.as_ref().map(|c| c.path.clone()) {
-                        self.open_convert(p);
+                    if let Some((p, rv)) = self.conv.as_ref().map(|c| (c.path.clone(), c.report_view)) {
+                        self.open_convert(p, rv);
                     }
                 }
             }
@@ -553,6 +567,9 @@ impl App {
                 }
                 if ui.add_enabled(one, egui::Button::new("Show in folder")).clicked() {
                     action = Some("reveal");
+                }
+                if ui.add_enabled(one, egui::Button::new("Plug-in report")).on_hover_text("Which plug-ins can be converted to VST3, without changing anything").clicked() {
+                    action = Some("report");
                 }
                 if ui.add_enabled(one, egui::Button::new("Convert to VST3…")).clicked() {
                     action = Some("convert");
@@ -755,7 +772,12 @@ impl App {
             }
             Some("convert") => {
                 if let Some(p) = sel_path(self) {
-                    self.open_convert(p);
+                    self.open_convert(p, false);
+                }
+            }
+            Some("report") => {
+                if let Some(p) = sel_path(self) {
+                    self.open_convert(p, true);
                 }
             }
             _ => {}
@@ -763,9 +785,18 @@ impl App {
     }
 
     // ---- convert
-    fn open_convert(&mut self, path: PathBuf) {
+    fn open_convert(&mut self, path: PathBuf, report_view: bool) {
         self.screen = Screen::Convert;
-        self.conv = Some(ConvertUi { path: path.clone(), plan: None, error: None, sel: 0, busy: Some("Reading the set and your installed VST3 plug-ins…".into()), result: None });
+        self.conv = Some(ConvertUi {
+            path: path.clone(),
+            plan: None,
+            error: None,
+            sel: 0,
+            busy: Some("Reading the set and your installed VST3 plug-ins…".into()),
+            result: None,
+            report_view,
+            busy_note: None,
+        });
         let (tx, ctx) = self.send();
         std::thread::spawn(move || {
             let _ = tx.send(Msg::Plan(vst3::analyze(&path, None)));
@@ -837,6 +868,51 @@ impl App {
                 .color(DIM),
             );
             ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut c.report_view, false, RichText::new("Plug-ins").strong());
+                ui.selectable_value(&mut c.report_view, true, RichText::new("Report").strong())
+                    .on_hover_text("What converting will do with the choices above, without changing anything");
+            });
+            ui.add_space(6.0);
+            if c.report_view {
+                let report = vst3::preview_report(plan);
+                let text = report.join("\n");
+                egui::Frame::none().fill(FIELD).rounding(4.0).inner_margin(12.0).show(ui, |ui| {
+                    egui::ScrollArea::vertical().max_height(ui.available_height() - 60.0).auto_shrink([false, false]).show(ui, |ui| {
+                        show_text(ui, &text);
+                    });
+                });
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(n_conv > 0, accent_button("Convert → save as new version")).clicked() {
+                        do_convert = true;
+                    }
+                    if ui.button("Copy report").clicked() {
+                        ui.ctx().copy_text(text.clone());
+                        c.busy_note = Some("Report copied".into());
+                    }
+                    if ui.button("Save report…").clicked() {
+                        let name = format!("{} - plug-in report.txt", stem(&c.path));
+                        let dlg = rfd::FileDialog::new().set_title("Save plug-in report").set_file_name(&name).add_filter("Text", &["txt"]);
+                        let dlg = match c.path.parent() {
+                            Some(d) => dlg.set_directory(d),
+                            None => dlg,
+                        };
+                        if let Some(dest) = dlg.save_file() {
+                            let nl = if cfg!(windows) { "\r\n" } else { "\n" };
+                            let body = text.replace('\n', nl) + nl;
+                            c.busy_note = Some(match std::fs::write(&dest, body) {
+                                Ok(()) => format!("Saved {}", dest.file_name().unwrap_or_default().to_string_lossy()),
+                                Err(e) => format!("Couldn't save: {e}"),
+                            });
+                        }
+                    }
+                    if let Some(n) = &c.busy_note {
+                        ui.label(RichText::new(n).color(DIM));
+                    }
+                });
+                return;
+            }
             let mut clicked = None;
             let table_h = (ui.available_height() - 110.0).max(120.0);
             egui::Frame::none().fill(FIELD).rounding(4.0).show(ui, |ui| {
