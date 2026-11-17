@@ -27,6 +27,7 @@ Usage:
   LiveVersions <set.als | folder>       open the version browser
   LiveVersions notes <set.als>...       (re)write change notes
   LiveVersions diff <old.als> <new.als> print what changed
+  LiveVersions versions <set.als | folder>  list versions and the next version's name
   LiveVersions report <set.als>         which plug-ins can be converted to VST3 (changes nothing)
   LiveVersions vst3 <set.als> [--dry-run] [--out <path>] [--mode <plugin>=<mode>]...
         modes: vst2state raw sidebyside default skip
@@ -41,7 +42,7 @@ fn main() {
         Some("--convert") => gui::run(gui::Start::Convert(args.get(1).map(PathBuf::from))),
         Some("--report") => gui::run(gui::Start::Report(args.get(1).map(PathBuf::from))),
         Some("--settings") => gui::run(gui::Start::Settings),
-        Some(cmd @ ("notes" | "diff" | "vst3" | "report" | "learn" | "help" | "--help" | "-h" | "/?")) => {
+        Some(cmd @ ("notes" | "diff" | "vst3" | "report" | "learn" | "versions" | "help" | "--help" | "-h" | "/?")) => {
             #[cfg(windows)]
             win::attach_console();
             let code = match cli(cmd, &args[1..]) {
@@ -94,6 +95,25 @@ fn cli(cmd: &str, rest: &[String]) -> Result<(), String> {
             println!("{}", changes::format_lines(&ch).join("\n"));
         }
         "vst3" => cli_vst3(rest)?,
+        "versions" => {
+            let p = PathBuf::from(rest.first().ok_or("versions needs a .als file or a folder")?);
+            let fams = if p.is_dir() {
+                versions::families_in(&p)
+            } else {
+                let fam = versions::family(&p);
+                vec![(versions::parse(&p).base, fam)]
+            };
+            for (base, vs) in fams {
+                println!("{base}");
+                for v in &vs {
+                    println!("  {:10} {}", v.label(), v.path.file_name().unwrap_or_default().to_string_lossy());
+                }
+                if let Some(last) = vs.last() {
+                    let next = versions::next_version_path(&last.path);
+                    println!("  next:      {}", next.file_name().unwrap_or_default().to_string_lossy());
+                }
+            }
+        }
         "report" => {
             let mut r = vec!["--dry-run".to_string()];
             r.extend(rest.iter().cloned());
