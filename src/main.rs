@@ -7,11 +7,13 @@
 //!   LiveVersions.exe --convert [set]  VST2/AU -> VST3 converter
 //!   LiveVersions.exe --report [set]   plug-in report (what converting would do)
 //!   LiveVersions.exe --settings       settings
+//!   LiveVersions.exe --sets           Live Sets (latest version of each set)
 //!   LiveVersions.exe notes|diff|vst3|learn …   command line (see `help`)
 mod als;
 mod changes;
 mod config;
 mod gui;
+mod sets;
 mod sqlite;
 mod versions;
 mod vst3;
@@ -28,6 +30,7 @@ Usage:
   LiveVersions notes <set.als>...       (re)write change notes
   LiveVersions diff <old.als> <new.als> print what changed
   LiveVersions versions <set.als | folder>  list versions and the next version's name
+  LiveVersions sets [folder]...         latest version of each set you've opened (or in the folders)
   LiveVersions report <set.als>         which plug-ins can be converted to VST3 (changes nothing)
   LiveVersions vst3 <set.als> [--dry-run] [--out <path>] [--mode <plugin>=<mode>]...
         modes: vst2state raw sidebyside duplicate default skip
@@ -46,7 +49,8 @@ fn main() {
         Some("--convert") => gui::run(gui::Start::Convert(args.get(1).map(PathBuf::from))),
         Some("--report") => gui::run(gui::Start::Report(args.get(1).map(PathBuf::from))),
         Some("--settings") => gui::run(gui::Start::Settings),
-        Some(cmd @ ("notes" | "diff" | "vst3" | "report" | "learn" | "versions" | "help" | "--help" | "-h" | "/?")) => {
+        Some("--sets") => gui::run(gui::Start::Sets),
+        Some(cmd @ ("notes" | "diff" | "vst3" | "report" | "learn" | "versions" | "sets" | "help" | "--help" | "-h" | "/?")) => {
             #[cfg(windows)]
             win::attach_console();
             let code = match cli(cmd, &args[1..]) {
@@ -117,6 +121,19 @@ fn cli(cmd: &str, rest: &[String]) -> Result<(), String> {
                     println!("  next:      {}", next.file_name().unwrap_or_default().to_string_lossy());
                 }
             }
+        }
+        "sets" => {
+            let list = if rest.is_empty() {
+                sets::recent()
+            } else {
+                let roots: Vec<PathBuf> = rest.iter().map(PathBuf::from).collect();
+                sets::scan(&roots, &std::sync::atomic::AtomicBool::new(false), |_| {})
+            };
+            for e in &list {
+                let saved: chrono::DateTime<chrono::Local> = chrono::DateTime::from_timestamp(e.saved, 0).unwrap_or_default().into();
+                println!("{}  {:<12} {:>3}  {}", saved.format("%Y-%m-%d %H:%M"), e.label, e.versions, e.latest.display());
+            }
+            println!("{} sets", list.len());
         }
         "report" => {
             let mut r = vec!["--dry-run".to_string()];

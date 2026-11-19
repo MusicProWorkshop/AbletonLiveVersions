@@ -2,11 +2,12 @@
 use eframe::egui::{self, Color32, RichText, Vec2};
 use egui_extras::{Column, TableBuilder};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::sets::{self, SetEntry};
 use crate::{als, changes, config, versions, vst3};
 
 const BG: Color32 = Color32::from_rgb(0x1e, 0x1e, 0x1e);
@@ -26,6 +27,8 @@ pub enum Start {
     /// The converter, opened on its Report tab.
     Report(Option<PathBuf>),
     Settings,
+    /// Live Sets: the latest version of each set.
+    Sets,
 }
 
 pub fn run(start: Start) {
@@ -44,6 +47,7 @@ pub fn run(start: Start) {
         Start::Settings => ("Live Versions — Settings", [720.0, 600.0]),
         Start::Convert(_) | Start::Report(_) => ("Live Versions — Convert to VST3", [1120.0, 640.0]),
         Start::Browser(_) => ("Live Versions", [1200.0, 720.0]),
+        Start::Sets => ("Live Versions — Live Sets", [1200.0, 720.0]),
     };
     let icon = egui::IconData { rgba: include_bytes!("../assets/icon64.rgba").to_vec(), width: 64, height: 64 };
     let opts = eframe::NativeOptions {
@@ -175,6 +179,10 @@ enum Msg {
     Plan(Result<vst3::Plan, String>),
     Converted(Result<(PathBuf, Vec<String>), String>),
     Learned(usize),
+    Recent(Vec<SetEntry>),
+    /// (scan id, folders looked at so far)
+    ScanProgress(u64, usize),
+    Scanned(u64, Vec<SetEntry>),
 }
 
 #[derive(PartialEq)]
@@ -182,6 +190,29 @@ enum Screen {
     Browser,
     Convert,
     Settings,
+    Sets,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum SetsTab {
+    Recent,
+    Folders,
+}
+
+struct SetsUi {
+    tab: SetsTab,
+    recent: Option<Vec<SetEntry>>,
+    scanned: Option<Vec<SetEntry>>,
+    /// Folders looked at by the scan that's running, if one is.
+    scanning: Option<usize>,
+    scan_id: u64,
+    cancel: Arc<AtomicBool>,
+    folders: Vec<PathBuf>,
+    filter: String,
+    /// One set per project folder (the most recently saved one).
+    per_project: bool,
+    /// Selected set (its key).
+    sel: Option<String>,
 }
 
 struct Row {
@@ -239,6 +270,10 @@ struct App {
     // other screens
     conv: Option<ConvertUi>,
     settings: Option<SettingsUi>,
+    sets: Option<SetsUi>,
+    /// Settings was opened from Live Sets: go back there when it closes.
+    settings_from_sets: bool,
+    title: String,
 }
 
 fn dir_signature(folder: &Path) -> String {
@@ -295,6 +330,9 @@ impl App {
             job: Arc::new(AtomicU64::new(0)),
             conv: None,
             settings: None,
+            sets: None,
+            settings_from_sets: false,
+            title: String::new(),
         };
         match start {
             Start::Browser(p) => {
@@ -316,6 +354,11 @@ impl App {
             Start::Settings => {
                 app.only_screen = true;
                 app.open_settings();
+            }
+            Start::Sets => {
+                app.last_live = live_set();
+                app.current_open = app.last_live.clone();
+                app.open_sets();
             }
         }
         app
@@ -454,6 +497,15 @@ impl App {
         let live = live_set();
         if live != self.last_live {
             self.last_live = live.clone();
+            if let Some(p) = &live {
+                // Also recorded by the tray; this covers running the browser on its own.
+                sets::record_opened(p);
+            }
+            if self.screen == Screen::Sets {
+                self.current_open = live;
+                self.reload_recent();
+                return;
+            }
             if let (true, Some(p)) = (self.follow_live, &live) {
                 let same_family = self.folder.as_deref() == p.parent() && versions::parse(p).base.trim() == self.base;
                 if !same_family && self.screen == Screen::Browser {
@@ -462,6 +514,9 @@ impl App {
                 }
             }
             self.current_open = live;
+        }
+        if self.screen != Screen::Browser {
+            return;
         }
         if let Some(f) = &self.folder {
             if dir_signature(f) != self.dir_sig {
@@ -511,6 +566,22 @@ impl App {
                         self.open_convert(p, rv);
                     }
                 }
+                Msg::Recent(v) => {
+                    if let Some(s) = self.sets.as_mut() {
+                        s.recent = Some(v);
+                    }
+                }
+                Msg::ScanProgress(id, n) => {
+                    if let Some(s) = self.sets.as_mut().filter(|s| s.scan_id == id) {
+                        s.scanning = Some(n);
+                    }
+                }
+                Msg::Scanned(id, v) => {
+                    if let Some(s) = self.sets.as_mut().filter(|s| s.scan_id == id) {
+                        s.scanning = None;
+                        s.scanned = Some(v);
+                    }
+                }
             }
         }
     }
@@ -539,6 +610,9 @@ impl App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("⚙ Settings").clicked() {
                         action = Some("settings");
+                    }
+                    if ui.button("Live Sets").on_hover_text("The latest version of each set you've opened, or of every set in your folders").clicked() {
+                        action = Some("sets");
                     }
                     if ui.button("Open set or folder…").clicked() {
                         action = Some("browse");
@@ -616,6 +690,9 @@ impl App {
                     ui.add_space(8.0);
                     if ui.add(accent_button("Open set or folder…")).clicked() {
                         action = Some("browse");
+                    }
+                    if ui.button("Live Sets").clicked() {
+                        action = Some("sets");
                     }
                     ui.add_space(6.0);
                     ui.label(RichText::new("You can also drop a .als file here.").color(DIM).small());
@@ -717,6 +794,7 @@ impl App {
                 }
             }
             Some("settings") => self.open_settings(),
+            Some("sets") => self.open_sets(),
             Some("open") => {
                 if let Some(p) = sel_path(self) {
                     open_in_live(&p);
@@ -1052,6 +1130,333 @@ impl App {
         }
     }
 
+    // ---- Live Sets
+    fn open_sets(&mut self) {
+        self.screen = Screen::Sets;
+        if self.sets.is_none() {
+            let cfg = config::load();
+            let folders: Vec<PathBuf> = cfg.set_folders.iter().map(PathBuf::from).collect();
+            let has_recent = !sets::live_pref_dirs().is_empty() || config::app_dir().join("recent_sets.json").exists();
+            self.sets = Some(SetsUi {
+                // Nothing opened yet but folders chosen: start on the folders.
+                tab: if !has_recent && !folders.is_empty() { SetsTab::Folders } else { SetsTab::Recent },
+                recent: None,
+                scanned: sets::cached_scan(&folders),
+                scanning: None,
+                scan_id: 0,
+                cancel: Arc::new(AtomicBool::new(false)),
+                folders,
+                filter: String::new(),
+                per_project: cfg.sets_one_per_project,
+                sel: None,
+            });
+            self.start_scan();
+        }
+        self.reload_recent();
+    }
+
+    fn reload_recent(&mut self) {
+        let (tx, ctx) = self.send();
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::Recent(sets::recent()));
+            ctx.request_repaint();
+        });
+    }
+
+    fn start_scan(&mut self) {
+        let (tx, ctx) = self.send();
+        let Some(s) = self.sets.as_mut() else { return };
+        s.cancel.store(true, Ordering::SeqCst);
+        if s.folders.is_empty() {
+            s.scanning = None;
+            s.scanned = Some(vec![]);
+            return;
+        }
+        s.cancel = Arc::new(AtomicBool::new(false));
+        s.scan_id += 1;
+        s.scanning = Some(0);
+        let (id, cancel, roots) = (s.scan_id, s.cancel.clone(), s.folders.clone());
+        std::thread::spawn(move || {
+            let found = sets::scan(&roots, &cancel, |n| {
+                let _ = tx.send(Msg::ScanProgress(id, n));
+                ctx.request_repaint();
+            });
+            if !cancel.load(Ordering::SeqCst) {
+                sets::save_scan(&roots, &found);
+                let _ = tx.send(Msg::Scanned(id, found));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn save_set_folders(&mut self) {
+        let Some(s) = self.sets.as_ref() else { return };
+        let mut c = config::load();
+        c.set_folders = s.folders.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        config::save(&c);
+        self.cfg.set_folders = c.set_folders;
+        self.start_scan();
+    }
+
+    fn sets_ui(&mut self, ctx: &egui::Context) {
+        enum Act {
+            View(PathBuf),
+            Open(PathBuf),
+            Reveal(PathBuf),
+            Forget(SetEntry),
+            AddFolder,
+            RemoveFolder(usize),
+            Rescan,
+            Browser,
+            Settings,
+        }
+        let mut act: Option<Act> = None;
+        let mut new_sel: Option<String> = None;
+        let open_key = self.current_open.as_deref().map(sets::key_for);
+        let Some(s) = self.sets.as_mut() else { return };
+
+        egui::TopBottomPanel::top("sets_top").frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin { left: 18.0, right: 18.0, top: 14.0, bottom: 8.0 })).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading(RichText::new("Live Sets").strong());
+                ui.add_space(16.0);
+                ui.selectable_value(&mut s.tab, SetsTab::Recent, "Recently opened");
+                ui.selectable_value(&mut s.tab, SetsTab::Folders, "In folders");
+                ui.add_space(12.0);
+                if ui
+                    .checkbox(&mut s.per_project, "One per project folder")
+                    .on_hover_text("Show only the most recently saved set of each project folder (a project can hold several sets, e.g. a radio edit and an extended mix)")
+                    .changed()
+                {
+                    let mut c = config::load();
+                    c.sets_one_per_project = s.per_project;
+                    config::save(&c);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("⚙ Settings").clicked() {
+                        act = Some(Act::Settings);
+                    }
+                    if ui.button("Version browser").clicked() {
+                        act = Some(Act::Browser);
+                    }
+                    ui.add(egui::TextEdit::singleline(&mut s.filter).hint_text("Filter").desired_width(200.0));
+                });
+            });
+            ui.label(
+                RichText::new(match s.tab {
+                    SetsTab::Recent => "The latest saved version of each set you've opened in Live.",
+                    SetsTab::Folders => "The latest saved version of each set in these folders and their subfolders, most recently saved first.",
+                })
+                .color(DIM)
+                .small(),
+            );
+            if s.tab == SetsTab::Folders {
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    for (i, f) in s.folders.iter().enumerate() {
+                        egui::Frame::none().fill(PANEL).rounding(4.0).inner_margin(egui::Margin::symmetric(8.0, 2.0)).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(f.display().to_string()).small());
+                                if ui.small_button("✕").on_hover_text("Stop scanning this folder").clicked() {
+                                    act = Some(Act::RemoveFolder(i));
+                                }
+                            });
+                        });
+                    }
+                    if ui.button("Add folder…").clicked() {
+                        act = Some(Act::AddFolder);
+                    }
+                    if !s.folders.is_empty() && ui.add_enabled(s.scanning.is_none(), egui::Button::new("Rescan")).clicked() {
+                        act = Some(Act::Rescan);
+                    }
+                });
+            }
+        });
+
+        let list: Option<&Vec<SetEntry>> = match s.tab {
+            SetsTab::Recent => s.recent.as_ref(),
+            SetsTab::Folders => s.scanned.as_ref(),
+        };
+        let needle = s.filter.trim().to_lowercase();
+        let matching = list
+            .into_iter()
+            .flatten()
+            .filter(|e| needle.is_empty() || e.base.to_lowercase().contains(&needle) || e.folder().to_string_lossy().to_lowercase().contains(&needle));
+        let shown: Vec<(&SetEntry, usize)> = if s.per_project { sets::one_per_folder(matching) } else { matching.map(|e| (e, 1)).collect() };
+
+        egui::TopBottomPanel::bottom("sets_bottom").frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin { left: 18.0, right: 18.0, top: 8.0, bottom: 14.0 })).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let total = list.map(|l| if s.per_project { sets::one_per_folder(l).len() } else { l.len() }).unwrap_or(0);
+                let what = if s.per_project { "projects" } else { "sets" };
+                let mut t = if needle.is_empty() { format!("{total} {what}") } else { format!("{} of {total} {what}", shown.len()) };
+                if let (SetsTab::Folders, Some(n)) = (s.tab, s.scanning) {
+                    t = format!("Scanning… {n} folders looked at   ·   {t}");
+                }
+                ui.label(RichText::new(t).color(DIM));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new("Double-click a set to see its versions").color(DIM).small());
+                });
+            });
+        });
+
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin { left: 18.0, right: 18.0, top: 4.0, bottom: 4.0 })).show(ctx, |ui| {
+            let empty = match (s.tab, list) {
+                (_, None) => Some(("Looking for your sets…", false)),
+                (SetsTab::Folders, _) if s.folders.is_empty() => Some(("Add the folders where you keep your Live projects.", true)),
+                (SetsTab::Folders, Some(l)) if l.is_empty() && s.scanning.is_some() => Some(("Scanning…", false)),
+                (SetsTab::Folders, Some(l)) if l.is_empty() => Some(("No Live sets in these folders.", false)),
+                (SetsTab::Recent, Some(l)) if l.is_empty() => Some(("Sets you open in Live will show up here.", false)),
+                _ if shown.is_empty() => Some(("No sets match the filter.", false)),
+                _ => None,
+            };
+            if let Some((msg, add)) = empty {
+                ui.add_space(40.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new(msg).color(DIM));
+                    if add {
+                        ui.add_space(8.0);
+                        if ui.add(accent_button("Add folder…")).clicked() {
+                            act = Some(Act::AddFolder);
+                        }
+                    }
+                });
+                return;
+            }
+            let recent_tab = s.tab == SetsTab::Recent;
+            egui::Frame::none().fill(FIELD).rounding(4.0).show(ui, |ui| {
+                TableBuilder::new(ui)
+                    .striped(true)
+                    .sense(egui::Sense::click())
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .column(Column::initial(300.0).at_least(160.0).clip(true).resizable(true))
+                    .column(Column::exact(130.0).clip(true))
+                    .column(Column::exact(140.0))
+                    .column(Column::exact(64.0))
+                    .column(Column::remainder().at_least(120.0).clip(true))
+                    .column(Column::exact(170.0))
+                    .header(28.0, |mut h| {
+                        for t in ["  Set", "Latest version", "Saved", "Versions", "Folder", ""] {
+                            h.col(|ui| {
+                                ui.label(RichText::new(t).color(DIM).small());
+                            });
+                        }
+                    })
+                    .body(|body| {
+                        body.rows(30.0, shown.len(), |mut row| {
+                            let (e, in_folder) = shown[row.index()];
+                            let key = e.key();
+                            row.set_selected(s.sel.as_deref() == Some(key.as_str()));
+                            let is_open = open_key.as_deref() == Some(key.as_str());
+                            row.col(|ui| {
+                                let t = if is_open { format!("  ▶ {}", e.base) } else { format!("  {}", e.base) };
+                                ui.label(RichText::new(t).color(if is_open { ACCENT } else { FG }).strong()).on_hover_text(e.latest.display().to_string());
+                                if in_folder > 1 {
+                                    ui.label(RichText::new(format!("+{} more sets", in_folder - 1)).color(DIM).small())
+                                        .on_hover_text("Other sets in this project folder. View shows them under “Other sets in this folder”; untick “One per project folder” to list them all.");
+                                }
+                            });
+                            row.col(|ui| {
+                                ui.label(&e.label);
+                            });
+                            row.col(|ui| {
+                                let saved: chrono::DateTime<chrono::Local> = chrono::DateTime::from_timestamp(e.saved, 0).unwrap_or_default().into();
+                                ui.label(RichText::new(saved.format("%d %b %Y  %H:%M").to_string()).color(DIM));
+                            });
+                            row.col(|ui| {
+                                ui.label(RichText::new(e.versions.to_string()).color(DIM));
+                            });
+                            row.col(|ui| {
+                                ui.label(RichText::new(e.folder().display().to_string()).color(DIM).small()).on_hover_text(e.folder().display().to_string());
+                            });
+                            row.col(|ui| {
+                                if ui.small_button("View").on_hover_text("See its versions and change notes").clicked() {
+                                    act = Some(Act::View(e.latest.clone()));
+                                }
+                                if ui.add(accent_button("Open in Live").small()).on_hover_text(e.latest.display().to_string()).clicked() {
+                                    act = Some(Act::Open(e.latest.clone()));
+                                }
+                            });
+                            let resp = row.response();
+                            if resp.double_clicked() {
+                                act = Some(Act::View(e.latest.clone()));
+                            } else if resp.clicked() {
+                                new_sel = Some(key.clone());
+                            }
+                            resp.context_menu(|ui| {
+                                if ui.button("View versions").clicked() {
+                                    act = Some(Act::View(e.latest.clone()));
+                                    ui.close_menu();
+                                }
+                                if ui.button("Open in Live").clicked() {
+                                    act = Some(Act::Open(e.latest.clone()));
+                                    ui.close_menu();
+                                }
+                                if ui.button("Show in folder").clicked() {
+                                    act = Some(Act::Reveal(e.latest.clone()));
+                                    ui.close_menu();
+                                }
+                                if recent_tab && ui.button("Remove from this list").clicked() {
+                                    act = Some(Act::Forget(e.clone()));
+                                    ui.close_menu();
+                                }
+                            });
+                        });
+                    });
+            });
+        });
+
+        if let (Some(k), Some(s)) = (new_sel, self.sets.as_mut()) {
+            s.sel = Some(k);
+        }
+        match act {
+            Some(Act::View(p)) => {
+                self.follow_live = false;
+                self.screen = Screen::Browser;
+                self.load(&p);
+            }
+            Some(Act::Open(p)) => {
+                open_in_live(&p);
+                self.status = format!("Opening {} in Live…", stem(&p));
+            }
+            Some(Act::Reveal(p)) => reveal(&p),
+            Some(Act::Forget(e)) => {
+                sets::forget(&e);
+                if let Some(l) = self.sets.as_mut().and_then(|s| s.recent.as_mut()) {
+                    l.retain(|x| x.key() != e.key());
+                }
+            }
+            Some(Act::AddFolder) => {
+                if let Some(f) = rfd::FileDialog::new().set_title("Choose a folder with Live projects").pick_folder() {
+                    if let Some(s) = self.sets.as_mut() {
+                        if !s.folders.contains(&f) {
+                            s.folders.push(f);
+                        }
+                        s.tab = SetsTab::Folders;
+                    }
+                    self.save_set_folders();
+                }
+            }
+            Some(Act::RemoveFolder(i)) => {
+                if let Some(s) = self.sets.as_mut() {
+                    if i < s.folders.len() {
+                        s.folders.remove(i);
+                    }
+                }
+                self.save_set_folders();
+            }
+            Some(Act::Rescan) => self.start_scan(),
+            Some(Act::Browser) => {
+                self.screen = Screen::Browser;
+                if self.rows.is_empty() {
+                    if let Some(p) = live_set() {
+                        self.load(&p);
+                    }
+                }
+            }
+            Some(Act::Settings) => self.open_settings(),
+            None => {}
+        }
+    }
+
     // ---- settings
     fn open_settings(&mut self) {
         #[cfg(windows)]
@@ -1059,6 +1464,7 @@ impl App {
         #[cfg(not(windows))]
         let startup = false;
         self.settings = Some(SettingsUi { cfg: config::load(), startup, message: String::new() });
+        self.settings_from_sets = self.screen == Screen::Sets;
         self.screen = Screen::Settings;
     }
 
@@ -1148,6 +1554,10 @@ impl App {
                     && hk_err(&s.cfg.hotkey_open_browser).is_none()
                     && version_format_error(&s.cfg).is_none();
                 if ui.add_enabled(ok, accent_button("Save")).clicked() {
+                    // Live Sets options are changed in that window: keep what's on disk.
+                    let disk = config::load();
+                    s.cfg.set_folders = disk.set_folders;
+                    s.cfg.sets_one_per_project = disk.sets_one_per_project;
                     config::save(&s.cfg);
                     #[cfg(windows)]
                     if s.startup != crate::win::startup_enabled() {
@@ -1169,7 +1579,7 @@ impl App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             } else {
                 self.cfg = config::load();
-                self.screen = Screen::Browser;
+                self.screen = if self.settings_from_sets { Screen::Sets } else { Screen::Browser };
             }
         }
     }
@@ -1218,6 +1628,20 @@ impl eframe::App for App {
             }
             Screen::Convert => self.convert_ui(ctx),
             Screen::Settings => self.settings_ui(ctx),
+            Screen::Sets => {
+                self.poll();
+                self.sets_ui(ctx);
+            }
+        }
+        let title = match self.screen {
+            Screen::Sets => "Live Versions — Live Sets",
+            Screen::Settings => "Live Versions — Settings",
+            Screen::Convert => "Live Versions — Convert to VST3",
+            Screen::Browser => "Live Versions",
+        };
+        if self.title != title {
+            self.title = title.to_string();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title.clone()));
         }
         ctx.request_repaint_after(Duration::from_millis(1000));
     }

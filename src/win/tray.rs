@@ -31,6 +31,7 @@ const ID_STARTUP: usize = 13;
 const ID_QUIT: usize = 14;
 const ID_NOTES_HELP: usize = 15;
 const ID_REPORT: usize = 16;
+const ID_SETS: usize = 17;
 
 enum Event {
     Balloon { title: String, body: String, error: bool },
@@ -42,6 +43,44 @@ enum Event {
 static EVENTS: Mutex<VecDeque<Event>> = Mutex::new(VecDeque::new());
 static SAVING: AtomicBool = AtomicBool::new(false);
 static HWND_MAIN: AtomicIsize = AtomicIsize::new(0);
+
+/// The set open in Live, as last recorded for the Live Sets list (by window
+/// title name), and when a name last failed to resolve to a file.
+static RECORDED: Mutex<(Option<String>, Option<(String, std::time::Instant)>)> = Mutex::new((None, None));
+static RESOLVING: AtomicBool = AtomicBool::new(false);
+
+/// Called every few seconds: when Live shows another set, remember it as opened.
+fn track_open_set() {
+    if RESOLVING.load(Ordering::SeqCst) {
+        return;
+    }
+    let Some(name) = live::live_main_window().and_then(|(_, t)| live::title_info(&t)).map(|(n, _)| n) else { return };
+    {
+        let r = RECORDED.lock().unwrap();
+        if r.0.as_deref() == Some(name.as_str()) {
+            return;
+        }
+        // An unsaved set ("Untitled") has no file: don't look for it every tick.
+        if let Some((failed, when)) = &r.1 {
+            if *failed == name && when.elapsed() < Duration::from_secs(30) {
+                return;
+            }
+        }
+    }
+    RESOLVING.store(true, Ordering::SeqCst);
+    std::thread::spawn(move || {
+        let found = live::current_set_path_named(&name);
+        let mut r = RECORDED.lock().unwrap();
+        match found {
+            Some(p) => {
+                crate::sets::record_opened(&p);
+                *r = (Some(name), None);
+            }
+            None => r.1 = Some((name, std::time::Instant::now())),
+        }
+        RESOLVING.store(false, Ordering::SeqCst);
+    });
+}
 
 struct State {
     hwnd: HWND,
@@ -195,6 +234,7 @@ fn show_menu(hwnd: HWND, cfg: &config::Config) -> usize {
         item(MF_STRING | MF_GRAYED, 0, "Live Versions is running");
         let _ = AppendMenuW(m, MF_SEPARATOR, 0, PCWSTR::null());
         item(MF_STRING, ID_BROWSE, &format!("Open version browser\t{}", pretty_hotkey(&cfg.hotkey_open_browser)));
+    item(MF_STRING, ID_SETS, "Live Sets…");
         item(MF_STRING, ID_REPORT, "Plug-in report for a set…");
         item(MF_STRING, ID_CONVERT, "Convert a set to VST3…");
         item(MF_STRING, ID_NOTES_HELP, &format!("How to save a version: {} in Live", pretty_hotkey(&cfg.hotkey_save_version)));
@@ -242,6 +282,9 @@ fn handle_command(st: &mut State, id: usize) {
         ID_BROWSE => open_browser(st),
         ID_CONVERT => {
             spawn_self(&["--convert"]);
+        }
+        ID_SETS => {
+            spawn_self(&["--sets"]);
         }
         ID_REPORT => {
             spawn_self(&["--report"]);
@@ -351,6 +394,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_TIMER => {
+            track_open_set();
             // Settings changed from the settings window: reload and re-register hotkeys.
             with_state(|s| {
                 let m = config::modified();
