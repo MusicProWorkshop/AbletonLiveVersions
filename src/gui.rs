@@ -135,6 +135,12 @@ fn open_in_live(path: &Path) {
     let _ = std::process::Command::new("explorer").arg(path).spawn();
 }
 
+/// Lets a click anywhere on a table row select it. egui labels are selectable by
+/// default, and a selectable label takes the click for itself (the text cursor).
+fn rows_clickable(ui: &mut egui::Ui) {
+    ui.style_mut().interaction.selectable_labels = false;
+}
+
 /// Opens the set's folder with the set selected.
 fn reveal(path: &Path) {
     #[cfg(windows)]
@@ -731,6 +737,7 @@ impl App {
             let mut double: Option<usize> = None;
             let open_cur = self.current_open.clone();
             egui::Frame::none().fill(FIELD).rounding(4.0).show(ui, |ui| {
+                rows_clickable(ui);
                 TableBuilder::new(ui)
                     .striped(true)
                     .sense(egui::Sense::click())
@@ -1031,6 +1038,7 @@ impl App {
             let table_h = (ui.available_height() - 110.0).max(120.0);
             egui::Frame::none().fill(FIELD).rounding(4.0).show(ui, |ui| {
                 ui.set_height(table_h);
+                rows_clickable(ui);
                 TableBuilder::new(ui)
                     .striped(true)
                     .sense(egui::Sense::click())
@@ -1353,6 +1361,7 @@ impl App {
             }
             let recent_tab = s.tab == SetsTab::Recent;
             egui::Frame::none().fill(FIELD).rounding(4.0).show(ui, |ui| {
+                rows_clickable(ui);
                 TableBuilder::new(ui)
                     .striped(true)
                     .sense(egui::Sense::click())
