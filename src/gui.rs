@@ -273,6 +273,9 @@ struct App {
     sets: Option<SetsUi>,
     /// Settings was opened from Live Sets: go back there when it closes.
     settings_from_sets: bool,
+    /// Live Sets is showing because no set was open in Live: switch to the
+    /// browser when one is (with Follow Live on).
+    sets_until_live: bool,
     title: String,
 }
 
@@ -332,14 +335,21 @@ impl App {
             settings: None,
             sets: None,
             settings_from_sets: false,
+            sets_until_live: false,
             title: String::new(),
         };
         match start {
             Start::Browser(p) => {
-                let p = p.or_else(live_set);
                 app.last_live = live_set();
-                if let Some(p) = p {
-                    app.load(&p);
+                app.current_open = app.last_live.clone();
+                match p.or_else(|| app.last_live.clone()) {
+                    Some(p) => app.load(&p),
+                    // No set given and none open in Live (or Live isn't running): the sets list,
+                    // until a set is opened in Live.
+                    None => {
+                        app.open_sets();
+                        app.sets_until_live = true;
+                    }
                 }
             }
             Start::Convert(Some(p)) => {
@@ -502,6 +512,12 @@ impl App {
                 sets::record_opened(p);
             }
             if self.screen == Screen::Sets {
+                if let (true, true, Some(p)) = (self.sets_until_live, self.follow_live, &live) {
+                    self.sets_until_live = false;
+                    self.screen = Screen::Browser;
+                    self.load(p);
+                    return;
+                }
                 self.current_open = live;
                 self.reload_recent();
                 return;
@@ -1132,6 +1148,8 @@ impl App {
 
     // ---- Live Sets
     fn open_sets(&mut self) {
+        // Opened on purpose: stay here (the default start sets this again after).
+        self.sets_until_live = false;
         self.screen = Screen::Sets;
         if self.sets.is_none() {
             let cfg = config::load();

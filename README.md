@@ -13,7 +13,9 @@ One file, `LiveVersions.exe` (about 6 MB). No installer, nothing else to install
 2. In Live, press **Ctrl+Alt+S**. The set is saved as the next version (`Song.als` → `Song v_2.als`,
    `Song v_6.als` → `Song v_7.als`) and Live keeps working in the new file. A small pop-up confirms
    it and says what changed.
-3. Press **Ctrl+Alt+V** (or click the tray icon) to open the **version browser**.
+3. Press **Ctrl+Alt+V** (or click the tray icon) to open the **version browser** for the set that's
+   open in Live. With no set open (or Live not running), it opens **Live Sets** instead, and switches
+   to a set's versions as soon as you open one in Live.
 
 Right-click the tray icon for: version browser, **Live Sets**, Plug-in report, Convert a set to VST3, Settings,
 **Start with Windows**, and **Quit** (which also closes any open browser, converter or settings window).
