@@ -135,8 +135,20 @@ fn open_in_live(path: &Path) {
     let _ = std::process::Command::new("explorer").arg(path).spawn();
 }
 
+/// Opens the set's folder with the set selected.
 fn reveal(path: &Path) {
-    let _ = std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn();
+    #[cfg(windows)]
+    {
+        // Explorer wants `/select,"<path>"`: with the usual quoting of the whole
+        // argument (`"/select,<path>"`, for paths with spaces) it ignores /select
+        // and opens Documents.
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", path.display())).spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+    }
 }
 
 fn stem(p: &Path) -> String {
