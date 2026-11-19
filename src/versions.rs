@@ -214,10 +214,14 @@ pub fn family(path: &Path) -> Vec<Version> {
 
 /// {base name: versions} for every set in a project folder.
 pub fn families_in(folder: &Path) -> Vec<(String, Vec<Version>)> {
-    let words = words(&config::load());
+    families_in_with(folder, &words(&config::load()))
+}
+
+/// [`families_in`] with the version words already loaded (for scanning many folders).
+pub fn families_in_with(folder: &Path, words: &[String]) -> Vec<(String, Vec<Version>)> {
     let mut map: std::collections::BTreeMap<String, Vec<Version>> = Default::default();
     for p in als_files(folder) {
-        let v = parse_with(&p, &words);
+        let v = parse_with(&p, words);
         map.entry(v.base.trim().to_string()).or_default().push(v);
     }
     let mut out: Vec<(String, Vec<Version>)> = map.into_iter().collect();

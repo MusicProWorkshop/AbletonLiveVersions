@@ -13,9 +13,11 @@ One file, `LiveVersions.exe` (about 6 MB). No installer, nothing else to install
 2. In Live, press **Ctrl+Alt+S**. The set is saved as the next version (`Song.als` → `Song v_2.als`,
    `Song v_6.als` → `Song v_7.als`) and Live keeps working in the new file. A small pop-up confirms
    it and says what changed.
-3. Press **Ctrl+Alt+V** (or click the tray icon) to open the **version browser**.
+3. Press **Ctrl+Alt+V** (or click the tray icon) to open the **version browser** for the set that's
+   open in Live. With no set open (or Live not running), it opens **Live Sets** instead, and switches
+   to a set's versions as soon as you open one in Live.
 
-Right-click the tray icon for: version browser, Plug-in report, Convert a set to VST3, Settings,
+Right-click the tray icon for: version browser, **Live Sets**, Plug-in report, Convert a set to VST3, Settings,
 **Start with Windows**, and **Quit** (which also closes any open browser, converter or settings window).
 
 If you're in an older version (v_3 while v_6 exists), the shortcut saves **v_7**, so nothing is
@@ -79,6 +81,23 @@ Ignored: knob tweaks, automation curves, small mixer moves, colours, and track r
 - **Your notes for this version**: free text, stored in the same .txt and kept when notes are regenerated.
 - Drop any `.als` on the window (or on the exe) to browse its versions.
 
+## Live Sets
+
+A list of your sets with only the **latest saved version** of each, from the tray menu (**Live
+Sets…**) or the browser's **Live Sets** button:
+
+- **Recently opened**: every set you've opened in Live. It starts with Live's own recent-sets list,
+  and the app adds each set it sees open in Live from then on.
+- **In folders**: every set in the folders you add (and their subfolders), most recently saved
+  first. Live's `Backup` folders and project `Samples` folders are skipped. The last scan is shown
+  right away while the folders are scanned again.
+
+Each set has **View** (its versions and change notes in the browser) and **Open in Live**.
+Right-click for **Show in folder** or, in Recently opened, **Remove from this list** (opening it
+again brings it back). **One per project folder** (on by default) shows only the most recently saved
+set of each project, for projects that hold several sets (a radio edit and an extended mix);
+untick it to list every set. **Filter** matches set and folder names.
+
 ## VST2 / AU → VST3
 
 From the browser (**Convert to VST3…**) or the tray menu. The original set is never changed; the
@@ -123,6 +142,7 @@ The same exe has a command line (run it from a terminal):
 LiveVersions notes <set.als>...         (re)write change notes
 LiveVersions diff <old.als> <new.als>   print what changed
 LiveVersions versions <set.als|folder>  list versions and what the next one will be called
+LiveVersions sets [folder]...           latest version of each set you've opened (or in the folders)
 LiveVersions report <set.als>           plug-in report: what converting would do (changes nothing)
 LiveVersions vst3 <set.als> [--dry-run] [--out <path>] [--mode "<plugin>=<mode>"]
 LiveVersions learn <folder>...          learn VST3 parameter IDs from sets
@@ -130,7 +150,7 @@ LiveVersions learn <folder>...          learn VST3 parameter IDs from sets
 
 ## Where things are
 
-- Settings and learned plug-in data: `%APPDATA%\LiveVersions`
+- Settings, learned plug-in data and the recently-opened list (`recent_sets.json`): `%APPDATA%\LiveVersions`
 - Cache of parsed sets (safe to delete): `%LOCALAPPDATA%\LiveVersions\cache`
 - "Start with Windows" adds `Live Versions` under `HKCU\...\CurrentVersion\Run`
 
@@ -168,7 +188,7 @@ made by `tools/third-party-notices.ps1`). The install/update section of the note
 attached to the run.
 
 Source: `src/als.rs` (read sets, snapshot), `changes.rs` (diff), `versions.rs` (v_N naming,
-notes), `vst3.rs` (converter), `sqlite.rs` (reads Live's plug-in database), `gui.rs` (windows),
+notes), `sets.rs` (Live Sets), `vst3.rs` (converter), `sqlite.rs` (reads Live's plug-in database), `gui.rs` (windows),
 `win/` (tray, hotkeys, pop-up, Save As automation).
 
 ## License

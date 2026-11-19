@@ -112,38 +112,17 @@ pub fn title_info(title: &str) -> Option<(String, bool)> {
 // ----------------------------------------------------------------------------- which set is open
 
 fn pref_dirs() -> Vec<PathBuf> {
-    let base = std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("Ableton"));
-    let mut dirs: Vec<PathBuf> = base
-        .and_then(|b| std::fs::read_dir(b).ok())
-        .map(|rd| {
-            rd.flatten()
-                .map(|e| e.path())
-                .filter(|p| p.file_name().map(|n| n.to_string_lossy().starts_with("Live ")).unwrap_or(false))
-                .map(|p| p.join("Preferences"))
-                .filter(|p| p.is_dir())
-                .collect()
-        })
-        .unwrap_or_default();
-    dirs.sort_by_key(|d| std::cmp::Reverse(std::fs::metadata(d).and_then(|m| m.modified()).ok()));
-    dirs
+    crate::sets::live_pref_dirs()
 }
 
 fn paths_in_crash_info(pref: &Path) -> Vec<String> {
     let Ok(data) = std::fs::read(pref.join("CrashRecoveryInfo.cfg")) else { return vec![] };
-    let re = Regex::new(r"[A-Za-z]:[/\\][^\x00-\x1f]*?\.als").unwrap();
-    let pref_l = pref.to_string_lossy().to_lowercase().replace('\\', "/");
-    let mut out = Vec::new();
-    for off in 0..2 {
-        let u16s: Vec<u16> = data[off..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        let text = String::from_utf16_lossy(&u16s);
-        for m in re.find_iter(&text) {
-            let p = m.as_str().to_string();
-            if !p.to_lowercase().replace('\\', "/").starts_with(&pref_l) {
-                out.push(p);
-            }
-        }
-    }
-    out
+    let pref_l = pref.to_string_lossy().to_lowercase();
+    crate::sets::als_paths_in_cfg(&data)
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|p| !p.to_lowercase().starts_with(&pref_l))
+        .collect()
 }
 
 fn paths_in_log(pref: &Path) -> Vec<String> {

@@ -23,6 +23,10 @@ pub struct Config {
     /// Keep the format a set (or its folder) already uses for new versions.
     pub keep_existing_format: bool,
     pub les_warning_shown: bool,
+    /// Folders the Live Sets window scans for sets (and their subfolders).
+    pub set_folders: Vec<String>,
+    /// Live Sets shows one set per project folder (the most recently saved one).
+    pub sets_one_per_project: bool,
 }
 
 impl Default for Config {
@@ -37,6 +41,8 @@ impl Default for Config {
             version_format: " v_#".into(),
             keep_existing_format: true,
             les_warning_shown: false,
+            set_folders: Vec::new(),
+            sets_one_per_project: true,
         }
     }
 }
